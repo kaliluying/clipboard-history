@@ -15,11 +15,13 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
-use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, PhysicalPosition, Position, State, WindowEvent};
+use tauri_plugin_autostart::ManagerExt as AutostartExt;
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 
 const HISTORY_FILE_NAME: &str = "clipboard-history.json";
 const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -33,6 +35,8 @@ struct AppSettings {
     history_limit: usize,
     storage_dir: String,
     global_shortcut: String,
+    launch_at_startup: bool,
+    always_on_top: bool,
 }
 
 impl Default for AppSettings {
@@ -42,6 +46,8 @@ impl Default for AppSettings {
             history_limit: 300,
             storage_dir: String::new(),
             global_shortcut: "Alt+Shift+V".to_string(),
+            launch_at_startup: false,
+            always_on_top: false,
         }
     }
 }
@@ -53,6 +59,8 @@ struct UpdateSettingsPayload {
     history_limit: Option<usize>,
     storage_dir: Option<String>,
     global_shortcut: Option<String>,
+    launch_at_startup: Option<bool>,
+    always_on_top: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +170,39 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings
 }
 
+fn set_always_on_top(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "未找到主窗口".to_string())?;
+
+    window
+        .set_always_on_top(enabled)
+        .map_err(|e| format!("设置窗口置顶失败: {e}"))
+}
+
+fn set_autostart_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let manager = app.autolaunch();
+    let current = manager
+        .is_enabled()
+        .map_err(|e| format!("读取开机自启状态失败: {e}"))?;
+
+    if current == enabled {
+        return Ok(());
+    }
+
+    if enabled {
+        manager
+            .enable()
+            .map_err(|e| format!("启用开机自启失败: {e}"))?;
+    } else {
+        manager
+            .disable()
+            .map_err(|e| format!("禁用开机自启失败: {e}"))?;
+    }
+
+    Ok(())
+}
+
 fn toggle_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
@@ -173,12 +214,30 @@ fn toggle_main_window(app: &AppHandle) {
     }
 }
 
+fn show_main_window_at_cursor(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+            return;
+        }
+
+        if let Ok(cursor) = app.cursor_position() {
+            let x = (cursor.x.round() as i32).saturating_add(12);
+            let y = (cursor.y.round() as i32).saturating_add(12);
+            let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+        }
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 fn setup_tray(app: &AppHandle) -> Result<(), String> {
     let toggle_item = MenuItem::with_id(app, "toggle", "显示/隐藏", true, None::<&str>)
         .map_err(|e| format!("创建托盘菜单失败: {e}"))?;
-    let quit_item =
-        MenuItem::with_id(app, "quit", "退出", true, None::<&str>).map_err(|e| format!("创建托盘菜单失败: {e}"))?;
-    let menu = Menu::with_items(app, &[&toggle_item, &quit_item]).map_err(|e| format!("创建托盘菜单失败: {e}"))?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)
+        .map_err(|e| format!("创建托盘菜单失败: {e}"))?;
+    let menu = Menu::with_items(app, &[&toggle_item, &quit_item])
+        .map_err(|e| format!("创建托盘菜单失败: {e}"))?;
 
     let icon = app
         .default_window_icon()
@@ -275,7 +334,8 @@ fn load_settings(app: &AppHandle) -> Result<AppSettings, String> {
 
 fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = settings_file(app)?;
-    let json = serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {e}"))?;
     fs::write(path, json).map_err(|e| format!("写入设置失败: {e}"))
 }
 
@@ -401,26 +461,44 @@ fn load_history_clean(app: &AppHandle) -> Result<Vec<ClipboardItem>, String> {
     let settings = load_settings(app)?;
     let items = load_history(app)?;
     let mut cleaned = clean_history(items, settings.history_limit);
-    let base_dir = data_dir(app)?;
     for item in &mut cleaned {
-        if item.item_type != "image" || item.image_preview_data_url.is_some() {
-            continue;
-        }
-        let Some(rel) = item.image_path.as_deref() else {
-            continue;
-        };
-        let path = base_dir.join(rel);
-        if let Ok(bytes) = fs::read(path) {
-            item.image_preview_data_url = Some(format!("data:image/png;base64,{}", BASE64.encode(bytes)));
-        }
+        item.image_preview_data_url = None;
     }
-    save_history(app, &cleaned)?;
     Ok(cleaned)
+}
+
+fn build_image_preview_data_url(
+    app: &AppHandle,
+    item: &ClipboardItem,
+) -> Result<Option<String>, String> {
+    if item.item_type != "image" {
+        return Ok(None);
+    }
+
+    let Some(rel) = item.image_path.as_deref() else {
+        return Ok(None);
+    };
+
+    let path = data_dir(app)?.join(rel);
+    let bytes = fs::read(path).map_err(|e| format!("读取图片预览失败: {e}"))?;
+    Ok(Some(format!(
+        "data:image/png;base64,{}",
+        BASE64.encode(bytes)
+    )))
 }
 
 fn save_history(app: &AppHandle, items: &[ClipboardItem]) -> Result<(), String> {
     let path = history_file(app)?;
-    let json = serde_json::to_string_pretty(items).map_err(|e| format!("序列化历史失败: {e}"))?;
+    let to_store: Vec<ClipboardItem> = items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            item.image_preview_data_url = None;
+            item
+        })
+        .collect();
+    let json =
+        serde_json::to_string_pretty(&to_store).map_err(|e| format!("序列化历史失败: {e}"))?;
     fs::write(path, json).map_err(|e| format!("写入历史失败: {e}"))
 }
 
@@ -468,7 +546,10 @@ fn image_item_from_png_bytes(app: &AppHandle, png_bytes: Vec<u8>) -> Result<Clip
     }
 
     let preview = if is_new_file {
-        Some(format!("data:image/png;base64,{}", BASE64.encode(&png_bytes)))
+        Some(format!(
+            "data:image/png;base64,{}",
+            BASE64.encode(&png_bytes)
+        ))
     } else {
         None
     };
@@ -748,11 +829,14 @@ fn fingerprint(item: &ClipboardItem) -> String {
     format!("{}:{}", item.item_type, item.content_hash)
 }
 
-fn dedupe_and_upsert(items: &mut Vec<ClipboardItem>, incoming: ClipboardItem, history_limit: usize) {
-    if let Some(idx) = items
-        .iter()
-        .position(|it| it.item_type == incoming.item_type && it.content_hash == incoming.content_hash)
-    {
+fn dedupe_and_upsert(
+    items: &mut Vec<ClipboardItem>,
+    incoming: ClipboardItem,
+    history_limit: usize,
+) {
+    if let Some(idx) = items.iter().position(|it| {
+        it.item_type == incoming.item_type && it.content_hash == incoming.content_hash
+    }) {
         let mut merged = items.remove(idx);
         merged.updated_at = now_ms();
         merged.image_preview_data_url = incoming
@@ -790,6 +874,22 @@ fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
+fn get_storage_dir_path(app: AppHandle) -> Result<String, String> {
+    ensure_storage_layout(&app)?;
+    let dir = data_dir(&app)?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn open_storage_dir(app: AppHandle) -> Result<(), String> {
+    ensure_storage_layout(&app)?;
+    let dir = data_dir(&app)?;
+    app.opener()
+        .open_path(dir.as_path().to_string_lossy().as_ref(), None::<&str>)
+        .map_err(|e| format!("打开目录失败: {e}"))
+}
+
+#[tauri::command]
 fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<AppSettings, String> {
     let current = load_settings(&app)?;
     let old_dir = data_dir_from_settings(&app, &current)?;
@@ -807,6 +907,12 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
     if let Some(v) = payload.global_shortcut {
         next.global_shortcut = v;
     }
+    if let Some(v) = payload.launch_at_startup {
+        next.launch_at_startup = v;
+    }
+    if let Some(v) = payload.always_on_top {
+        next.always_on_top = v;
+    }
     next = normalize_settings(next);
 
     save_settings(&app, &next)?;
@@ -815,6 +921,20 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
     migrate_storage_if_needed(&old_dir, &new_dir)?;
 
     register_global_shortcut(&app, &next.global_shortcut)?;
+    if let Err(err) = set_autostart_enabled(&app, next.launch_at_startup) {
+        append_log(
+            &app,
+            "WARN",
+            &format!("apply autostart setting failed: {err}"),
+        );
+    }
+    if let Err(err) = set_always_on_top(&app, next.always_on_top) {
+        append_log(
+            &app,
+            "WARN",
+            &format!("apply always-on-top setting failed: {err}"),
+        );
+    }
 
     Ok(next)
 }
@@ -823,6 +943,16 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
 fn get_history(app: AppHandle) -> Result<Vec<ClipboardItem>, String> {
     ensure_storage_layout(&app)?;
     load_history_clean(&app)
+}
+
+#[tauri::command]
+fn get_image_preview(id: String, app: AppHandle) -> Result<Option<String>, String> {
+    ensure_storage_layout(&app)?;
+    let item = load_history_clean(&app)?
+        .into_iter()
+        .find(|it| it.id == id)
+        .ok_or_else(|| "未找到历史项".to_string())?;
+    build_image_preview_data_url(&app, &item)
 }
 
 #[tauri::command]
@@ -1012,7 +1142,12 @@ fn poll_clipboard(app: AppHandle, state: State<AppState>) -> Result<Option<Clipb
             &format!("history updated with {item_type} item, source={capture_source}, detail={capture_debug}"),
         );
     }
-    Ok(items.first().cloned())
+    let mut latest = items.first().cloned();
+    if let Some(item) = &mut latest {
+        item.image_preview_data_url = build_image_preview_data_url(&app, item).ok().flatten();
+    }
+
+    Ok(latest)
 }
 
 #[tauri::command]
@@ -1051,6 +1186,14 @@ fn copy_history_item(id: String, app: AppHandle, state: State<AppState>) -> Resu
 }
 
 #[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    let mut clipboard = Clipboard::new().map_err(|e| format!("访问系统剪贴板失败: {e}"))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| format!("写入文本到剪贴板失败: {e}"))
+}
+
+#[tauri::command]
 fn toggle_favorite(id: String, app: AppHandle) -> Result<Option<ClipboardItem>, String> {
     let mut items = load_history_clean(&app)?;
     let mut updated: Option<ClipboardItem> = None;
@@ -1074,6 +1217,42 @@ fn toggle_favorite(id: String, app: AppHandle) -> Result<Option<ClipboardItem>, 
     }
 
     Ok(updated)
+}
+
+#[tauri::command]
+fn delete_history_item(id: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let _guard = state
+        .history_lock
+        .lock()
+        .map_err(|_| "历史锁获取失败".to_string())?;
+
+    let mut items = load_history_clean(&app)?;
+    let idx = items
+        .iter()
+        .position(|it| it.id == id)
+        .ok_or_else(|| "未找到历史项".to_string())?;
+    let removed = items.remove(idx);
+
+    if removed.item_type == "image" {
+        if let Some(rel) = removed.image_path.as_deref() {
+            let path = data_dir(&app)?.join(rel);
+            if path.exists() {
+                fs::remove_file(path).map_err(|e| format!("删除图片失败: {e}"))?;
+            }
+        }
+    }
+
+    save_history(&app, &items)?;
+
+    let mut last = state
+        .last_capture_fingerprint
+        .lock()
+        .map_err(|_| "指纹锁获取失败".to_string())?;
+    if last.as_deref() == Some(&fingerprint(&removed)) {
+        *last = None;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -1110,16 +1289,18 @@ fn clear_history(app: AppHandle, state: State<AppState>) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
-                        toggle_main_window(app);
+                        show_main_window_at_cursor(app);
                     }
                 })
                 .build(),
         )
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             setup_tray(&app.handle())?;
@@ -1129,6 +1310,20 @@ pub fn run() {
                 eprintln!("global shortcut setup failed: {err}");
                 let fallback = "Alt+Shift+V";
                 register_global_shortcut(&app.handle(), fallback)?;
+            }
+            if let Err(err) = set_autostart_enabled(&app.handle(), settings.launch_at_startup) {
+                append_log(
+                    &app.handle(),
+                    "WARN",
+                    &format!("setup autostart failed: {err}"),
+                );
+            }
+            if let Err(err) = set_always_on_top(&app.handle(), settings.always_on_top) {
+                append_log(
+                    &app.handle(),
+                    "WARN",
+                    &format!("setup always-on-top failed: {err}"),
+                );
             }
             Ok(())
         })
@@ -1140,11 +1335,16 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
+            get_storage_dir_path,
+            open_storage_dir,
             update_settings,
             get_history,
+            get_image_preview,
             poll_clipboard,
             copy_history_item,
+            copy_text,
             toggle_favorite,
+            delete_history_item,
             clear_history
         ])
         .run(tauri::generate_context!())

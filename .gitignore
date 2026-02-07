@@ -29,3 +29,6 @@ target/
 !.env.example
 Thumbs.db
 gen/
+clipboard-images/
+clipboard-history.json
+settings.json

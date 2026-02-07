@@ -5,8 +5,14 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-always-on-top",
     "opener:default",
+    "dialog:default",
     "global-shortcut:default",
+    "autostart:default",
     "clipboard-manager:allow-read-image",
     "clipboard-manager:allow-read-text"
   ]
