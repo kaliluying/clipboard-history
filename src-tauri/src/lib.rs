@@ -17,7 +17,7 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, PhysicalPosition, Position, State, WindowEvent};
+use tauri::{AppHandle, Manager, PhysicalPosition, Position, State, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -27,6 +27,7 @@ const HISTORY_FILE_NAME: &str = "clipboard-history.json";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const IMAGE_DIR_NAME: &str = "clipboard-images";
 const LOG_FILE_NAME: &str = "clipboard-history.log";
+const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +105,10 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|dur| dur.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn launched_from_autostart() -> bool {
+    std::env::args().any(|arg| arg == AUTOSTART_LAUNCH_ARG)
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -214,6 +219,32 @@ fn toggle_main_window(app: &AppHandle) {
     }
 }
 
+fn clamp_window_position_to_monitor(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    desired_x: i32,
+    desired_y: i32,
+) -> Option<(i32, i32)> {
+    let monitor = app
+        .monitor_from_point(f64::from(desired_x), f64::from(desired_y))
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten())?;
+
+    let monitor_pos = monitor.position();
+    let monitor_size = monitor.size();
+    let window_size = window.outer_size().ok()?;
+
+    let min_x = i64::from(monitor_pos.x);
+    let min_y = i64::from(monitor_pos.y);
+    let max_x = (min_x + i64::from(monitor_size.width) - i64::from(window_size.width)).max(min_x);
+    let max_y = (min_y + i64::from(monitor_size.height) - i64::from(window_size.height)).max(min_y);
+
+    let clamped_x = i64::from(desired_x).clamp(min_x, max_x) as i32;
+    let clamped_y = i64::from(desired_y).clamp(min_y, max_y) as i32;
+    Some((clamped_x, clamped_y))
+}
+
 fn show_main_window_at_cursor(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
@@ -224,11 +255,51 @@ fn show_main_window_at_cursor(app: &AppHandle) {
         if let Ok(cursor) = app.cursor_position() {
             let x = (cursor.x.round() as i32).saturating_add(12);
             let y = (cursor.y.round() as i32).saturating_add(12);
-            let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+            let (target_x, target_y) =
+                clamp_window_position_to_monitor(app, &window, x, y).unwrap_or((x, y));
+            let _ = window.set_position(Position::Physical(PhysicalPosition::new(
+                target_x, target_y,
+            )));
         }
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+fn position_main_window_bottom_right(app: &AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "未找到主窗口".to_string())?;
+    let monitor = window
+        .current_monitor()
+        .map_err(|e| format!("读取当前显示器失败: {e}"))?;
+
+    let Some(monitor) = monitor else {
+        return Ok(());
+    };
+
+    let monitor_pos = monitor.position();
+    let monitor_size = monitor.size();
+    let window_size = window
+        .outer_size()
+        .map_err(|e| format!("读取窗口尺寸失败: {e}"))?;
+    let margin = 16_i64;
+
+    let target_x = (i64::from(monitor_pos.x) + i64::from(monitor_size.width)
+        - i64::from(window_size.width)
+        - margin)
+        .max(i64::from(monitor_pos.x));
+    let target_y = (i64::from(monitor_pos.y) + i64::from(monitor_size.height)
+        - i64::from(window_size.height)
+        - margin)
+        .max(i64::from(monitor_pos.y));
+
+    window
+        .set_position(Position::Physical(PhysicalPosition::new(
+            target_x as i32,
+            target_y as i32,
+        )))
+        .map_err(|e| format!("设置默认窗口位置失败: {e}"))
 }
 
 fn setup_tray(app: &AppHandle) -> Result<(), String> {
@@ -1003,9 +1074,9 @@ fn poll_clipboard(app: AppHandle, state: State<AppState>) -> Result<Option<Clipb
     }
 
     if image_captured.is_none() {
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(5));
         plugin_to_arboard_waited = true;
-        for attempt in 0..6 {
+        for attempt in 0..2 {
             arboard_attempts = attempt + 1;
             match clipboard.get_image() {
                 Ok(image) => {
@@ -1018,8 +1089,8 @@ fn poll_clipboard(app: AppHandle, state: State<AppState>) -> Result<Option<Clipb
                     arboard_last_error = err.to_string();
                 }
             }
-            if attempt < 5 {
-                thread::sleep(Duration::from_millis(50));
+            if attempt < 1 {
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -1289,7 +1360,11 @@ fn clear_history(app: AppHandle, state: State<AppState>) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
-        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg(AUTOSTART_LAUNCH_ARG)
+                .build(),
+        )
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -1303,7 +1378,23 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            let silent_start = launched_from_autostart();
             setup_tray(&app.handle())?;
+            if let Err(err) = position_main_window_bottom_right(&app.handle()) {
+                append_log(
+                    &app.handle(),
+                    "WARN",
+                    &format!("setup default window position failed: {err}"),
+                );
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                if silent_start {
+                    let _ = window.hide();
+                } else {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
             ensure_storage_layout(&app.handle())?;
             let settings = load_settings(&app.handle())?;
             if let Err(err) = register_global_shortcut(&app.handle(), &settings.global_shortcut) {
