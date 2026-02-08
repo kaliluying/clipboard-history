@@ -27,12 +27,14 @@ const previewLoadingMap = ref({});
 const expandedTextItem = ref(null);
 const copiedItemId = ref("");
 const copyBubble = ref({ visible: false, x: 0, y: 0, key: 0 });
+const isClearHistoryConfirming = ref(false);
 const appWindow = getCurrentWindow();
 
 let timer = null;
 let saveSettingsTimer = null;
 let copiedItemTimer = null;
 let copyBubbleTimer = null;
+let clearHistoryConfirmTimer = null;
 let isHydratingSettings = true;
 
 function showCopyFeedback(itemId, mouseEvent) {
@@ -375,12 +377,26 @@ async function deleteItem(item) {
 }
 
 async function clearAllHistory() {
+  if (clearHistoryConfirmTimer === null) {
+    notice.value = "危险操作：请再次点击红色按钮确认删除全部历史";
+    isClearHistoryConfirming.value = true;
+    clearHistoryConfirmTimer = window.setTimeout(() => {
+      isClearHistoryConfirming.value = false;
+      clearHistoryConfirmTimer = null;
+    }, 2500);
+    return;
+  }
+
+  window.clearTimeout(clearHistoryConfirmTimer);
+  clearHistoryConfirmTimer = null;
+  isClearHistoryConfirming.value = false;
+
   try {
     await invoke("clear_history");
     history.value = [];
     imagePreviewMap.value = {};
     previewLoadingMap.value = {};
-    notice.value = "";
+    notice.value = "已删除全部历史";
   } catch (error) {
     console.error("clear_history failed", error);
     notice.value = "清空失败";
@@ -496,11 +512,14 @@ onUnmounted(() => {
   if (copyBubbleTimer !== null) {
     window.clearTimeout(copyBubbleTimer);
   }
+  if (clearHistoryConfirmTimer !== null) {
+    window.clearTimeout(clearHistoryConfirmTimer);
+  }
 });
 </script>
 
 <template>
-  <main class="app-shell" @mousedown="startWindowDrag" @mousemove="onUserInteraction" @scroll.capture="onUserInteraction">
+  <main class="app-shell" @mousemove="onUserInteraction" @scroll.capture="onUserInteraction">
     <div class="ambient ambient-1" aria-hidden="true"></div>
     <div class="ambient ambient-2" aria-hidden="true"></div>
     <div
@@ -512,12 +531,12 @@ onUnmounted(() => {
       已复制
     </div>
 
-    <header class="titlebar panel">
+    <header class="titlebar panel" @mousedown="startWindowDrag">
       <div class="titlebar-name">Clipboard History</div>
       <button class="titlebar-btn no-drag" @mousedown.stop @click.stop="hideWindow">×</button>
     </header>
 
-    <section class="panel controls">
+    <section class="panel controls" @mousedown="startWindowDrag">
       <template v-if="page === 'history'">
         <div class="filters">
           <button :class="['chip', { active: filter === 'all' }]" @click="filter = 'all'">全部</button>
@@ -595,7 +614,9 @@ onUnmounted(() => {
           </div>
 
           <div class="setting-actions bottom-setting-actions">
-            <button class="chip danger" @click="clearAllHistory">删除全部历史</button>
+            <button class="chip danger" :class="{ 'danger-confirm': isClearHistoryConfirming }" @click="clearAllHistory">
+              {{ isClearHistoryConfirming ? "再次点击确认删除" : "删除全部历史" }}
+            </button>
           </div>
         </div>
       </template>
@@ -979,6 +1000,27 @@ html,
   border-color: rgba(244, 114, 182, 0.45);
   color: #fbcfe8;
   white-space: nowrap;
+}
+
+.chip.danger-confirm {
+  background: rgba(220, 38, 38, 0.9);
+  border-color: rgba(254, 202, 202, 0.9);
+  color: #fff1f2;
+  font-weight: 700;
+  box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.35);
+  animation: danger-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes danger-pulse {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.02);
+  }
+  100% {
+    transform: scale(1);
+  }
 }
 
 .save-btn {

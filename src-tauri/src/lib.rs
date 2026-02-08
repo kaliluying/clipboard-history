@@ -900,6 +900,34 @@ fn fingerprint(item: &ClipboardItem) -> String {
     format!("{}:{}", item.item_type, item.content_hash)
 }
 
+fn fingerprint_from_current_clipboard() -> Option<String> {
+    let mut clipboard = Clipboard::new().ok()?;
+
+    if let Ok(image) = clipboard.get_image() {
+        if let Ok(png_bytes) = encode_rgba_to_png_bytes(&image) {
+            let content_hash = hash_bytes(&png_bytes);
+            return Some(format!("image:{content_hash}"));
+        }
+    }
+
+    if let Some((w, h, rgba)) = read_clipboard_image_win32() {
+        if let Ok(png_bytes) = encode_rgba_raw_to_png_bytes(w, h, rgba) {
+            let content_hash = hash_bytes(&png_bytes);
+            return Some(format!("image:{content_hash}"));
+        }
+    }
+
+    if let Ok(text) = clipboard.get_text() {
+        let normalized = normalize_text(&text);
+        if !normalized.is_empty() && !is_internal_log_text(&normalized) {
+            let content_hash = hash_bytes(normalized.as_bytes());
+            return Some(format!("text:{content_hash}"));
+        }
+    }
+
+    None
+}
+
 fn dedupe_and_upsert(
     items: &mut Vec<ClipboardItem>,
     incoming: ClipboardItem,
@@ -1347,11 +1375,13 @@ fn clear_history(app: AppHandle, state: State<AppState>) -> Result<(), String> {
         }
     }
 
+    let current_fingerprint = fingerprint_from_current_clipboard();
+
     let mut last = state
         .last_capture_fingerprint
         .lock()
         .map_err(|_| "指纹锁获取失败".to_string())?;
-    *last = None;
+    *last = current_fingerprint;
 
     Ok(())
 }
