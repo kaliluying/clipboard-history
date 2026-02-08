@@ -124,17 +124,20 @@ function keyToAccelerator(event) {
 }
 
 function startRecordShortcut() {
-  if (isRecordingShortcut.value) {
-    cancelRecordShortcut();
-    return;
-  }
+  if (isRecordingShortcut.value) return;
   isRecordingShortcut.value = true;
   notice.value = "请按下新的快捷键组合";
 }
 
 function cancelRecordShortcut() {
+  if (!isRecordingShortcut.value) return;
   isRecordingShortcut.value = false;
   notice.value = "已取消快捷键录制";
+}
+
+function onShortcutInputBlur() {
+  if (!isRecordingShortcut.value) return;
+  cancelRecordShortcut();
 }
 
 function onShortcutKeydown(event) {
@@ -395,6 +398,8 @@ async function saveSettings() {
     return;
   }
 
+  const previousShortcut = shortcut.value;
+
   try {
     const settings = await invoke("update_settings", {
       payload: {
@@ -420,7 +425,11 @@ async function saveSettings() {
       void pollClipboard();
     }, pollIntervalMs.value);
 
-    notice.value = "";
+    if (settings.globalShortcut !== previousShortcut) {
+      notice.value = `已保存快捷键：${settings.globalShortcut}`;
+    } else {
+      notice.value = "";
+    }
   } catch (error) {
     console.error("save settings failed", error);
     notice.value = "设置保存失败";
@@ -537,12 +546,10 @@ onUnmounted(() => {
                 :value="shortcutDraft"
                 readonly
                 @keydown="onShortcutKeydown"
-                @focus="startRecordShortcut"
-                placeholder="点击后按下组合键"
+                @click="startRecordShortcut"
+                @blur="onShortcutInputBlur"
+                placeholder="点击输入框后按下组合键"
               />
-              <button class="chip" @click="startRecordShortcut">
-                {{ isRecordingShortcut ? "取消录制" : "录入快捷键" }}
-              </button>
             </div>
           </div>
 
