@@ -1,171 +1,177 @@
 # AGENTS.md
 
-本文件面向在 `clipboard-history` 仓库中工作的自动化编码代理。
-目标：快速对齐命令入口、工程约束与代码风格，减少无效试错。
+本文件给在 `clipboard-history` 仓库工作的自动化编码代理使用。
+目标：先核实、再修改；确保改动可运行、可验证、可维护。
 
 ## 1) 项目基线
 
 - 技术栈：Tauri 2 + Vue 3 + Vite。
-- 前端语言：JavaScript（非 TypeScript）。
-- 后端语言：Rust（Tauri command + 本地存储 + 托盘 + 快捷键）。
-- 包管理器：npm（依据 `package-lock.json`）。
+- 前端：JavaScript + Vue SFC（`<script setup>`），无 TypeScript。
+- 后端：Rust（Tauri commands、剪贴板、托盘、快捷键、持久化）。
+- 包管理器：npm（有 `package-lock.json`）。
 - 前端入口：`src/main.js`。
-- 主界面：`src/App.vue`。
+- 前端主界面：`src/App.vue`。
 - 后端入口：`src-tauri/src/main.rs`。
 - 后端核心：`src-tauri/src/lib.rs`。
 - Tauri 配置：`src-tauri/tauri.conf.json`。
 
-## 2) 命令清单（先确认再执行）
+## 2) 已验证命令
 
-在仓库根目录执行：
+默认在仓库根目录执行。
 
 ```bash
+# 安装依赖
 npm install
-```
 
-### 2.1 开发/构建
-
-```bash
-# 前端开发
+# 前端开发 / 构建 / 预览
 npm run dev
-
-# 前端构建
 npm run build
-
-# 前端预览
 npm run preview
 
-# Tauri CLI 入口（可透传子命令）
+# Tauri CLI 入口（透传）
 npm run tauri -- <subcommand>
 
-# 桌面联调（前端 + Tauri）
+# 桌面联调 / 打包
 npm run tauri dev
-
-# 桌面产物构建
 npm run tauri build
 ```
 
-### 2.2 lint / test / typecheck 现状
+说明：`package.json` 当前仅有 `dev/build/preview/tauri` 四个脚本。
+
+## 3) lint / test / typecheck 现状（2026-02-08）
 
 - 未配置 ESLint/Prettier 命令。
 - 未配置 Vitest/Jest 命令。
-- 未配置 `tsc` 类型检查。
-- 未提供可直接运行的 Rust 测试模块。
+- 未配置 `tsc` 检查（项目为 JavaScript）。
+- Rust 无现成 `#[test]` 用例入口。
 
-### 2.3 单测运行（重点）
+## 4) 单测执行规则（重点）
 
-当前仓库没有单测入口，因此不存在“单文件单测”或“按用例名运行”命令。
+### 4.1 当前结论
 
-如后续新增测试，可参考（示例，非当前可用）：
+当前仓库没有可直接执行的单测命令，不要假设存在 `npm test`。
+
+### 4.2 后续若新增测试框架，优先使用
 
 ```bash
-# Vitest 示例
-npx vitest path/to/file.test.js
-npx vitest -t "test name"
+# Vitest
+npx vitest run path/to/file.test.js
+npx vitest -t "case name"
 
-# Rust 示例
-cargo test test_name --manifest-path src-tauri/Cargo.toml
+# Jest
+npx jest path/to/file.test.js
+npx jest -t "case name"
+
+# Rust
+cargo test case_name --manifest-path src-tauri/Cargo.toml
 ```
 
-## 3) 通用编码原则
+官方参考：
+- Vitest CLI: https://vitest.dev/guide/cli.html
+- Jest CLI: https://jestjs.io/docs/cli
+- Cargo test: https://doc.rust-lang.org/cargo/commands/cargo-test.html
 
-1. 修复问题优先最小改动，不做无关重构。
-2. 不臆造脚本/配置，先核实仓库是否存在。
-3. 变更前后端联动时，先对齐 command 名称与参数结构。
-4. 前端对外数据字段保持 camelCase（Rust 侧用 serde rename 保证）。
-5. 禁止静默失败，错误必须可观测。
+### 4.3 同步要求
 
-## 4) 前端规范（Vue + JS）
+若仓库新增测试能力，必须同步更新：
+- 第 3 节的现状说明；
+- 本节可执行命令；
+- 示例路径与脚本名。
 
-### 4.1 组织方式
+## 5) 通用改动原则
 
-- 使用 Vue 3 Composition API，优先 `<script setup>`。
-- 状态使用 `ref` / `computed`，生命周期使用 `onMounted` / `onUnmounted`。
-- 与后端交互统一使用 `invoke("command")`。
-- 异步逻辑使用 `async/await`，避免回调嵌套。
+- 优先最小改动修复，不夹带无关重构。
+- 修改前先确认命令、文件、配置真实存在。
+- 前后端协议改动时，`invoke` 参数与 Rust 结构体同步调整。
+- 禁止静默失败，错误必须可观测（日志或用户提示）。
+- 涉及存储结构改动时，先考虑迁移与回滚。
 
-### 4.2 Import 约定
+## 6) 前端规范（Vue + JS）
 
-- 使用 ES Module import。
+### 6.1 导入与组织
+
+- 使用 ES Module。
 - 第三方依赖在前，本地模块在后。
-- 同源导入尽量合并一条语句。
+- 同来源导入尽量合并，按语义分组。
 
-### 4.3 命名与格式
+### 6.2 命名与格式
 
 - 变量/函数：`camelCase`。
-- 常量：`UPPER_SNAKE_CASE`（如 `DEFAULT_POLL_INTERVAL_MS`）。
+- 常量：`UPPER_SNAKE_CASE`。
 - 组件文件：`PascalCase.vue`。
 - CSS 类名：`kebab-case`。
-- 延续现状：双引号、分号、2 空格缩进。
+- 保持现状：双引号、分号、2 空格缩进。
 
-### 4.4 错误处理
+### 6.3 状态与异步
 
-- `invoke` 相关异步流程必须 `try/catch`。
-- `catch` 至少包含：
-  - `console.error` 输出上下文；
-  - 用户可见反馈（如 `notice`）。
-- 禁止空 catch。
+- 组合式 API：`ref`、`computed`、`watch`、`onMounted`、`onUnmounted`。
+- 与后端交互统一 `invoke("command")`。
+- 异步统一 `async/await`。
 
-## 5) 后端规范（Rust + Tauri）
+### 6.4 错误处理
 
-### 5.1 Command 设计
+- 关键异步流程使用 `try/catch`。
+- `catch` 里至少包含：
+  1) `console.error("context", error)`；
+  2) 用户可见提示（如 `notice`）。
+- 禁止空 `catch`。
+
+## 7) 后端规范（Rust + Tauri）
+
+### 7.1 Command 与返回
 
 - 对外接口使用 `#[tauri::command]`。
 - 返回类型优先 `Result<T, String>`。
-- 错误信息需包含上下文，便于前端展示与排查。
+- 错误信息必须包含上下文。
 
-### 5.2 命名与序列化
+### 7.2 命名与序列化
 
-- Rust 内部标识符使用 `snake_case`。
-- 前端消费字段使用 `camelCase`：
-  - `#[serde(rename_all = "camelCase")]` 或字段级 `#[serde(rename = "...")]`。
-- 结构体/枚举类型名使用 `PascalCase`。
+- Rust 内部标识符：`snake_case`。
+- 类型名：`PascalCase`。
+- 前端字段：`camelCase`，优先 `#[serde(rename_all = "camelCase")]`。
+- 必要时使用字段级 `#[serde(rename = "...")]`。
 
-### 5.3 状态与并发
+### 7.3 并发与状态
 
-- 共享状态通过 `State<AppState>` 管理。
-- 并发访问通过 `Mutex` 保护关键区。
-- 锁失败时返回明确错误，不吞掉异常。
+- 全局状态通过 `State<AppState>` 管理。
+- 关键共享数据使用 `Mutex`。
+- 锁失败返回明确错误，不 panic、不吞错。
 
-### 5.4 存储与迁移
+### 7.4 存储与文件操作
 
 - 先确保目录结构存在（参考 `ensure_storage_layout`）。
-- JSON 写入保持可读性（当前使用 `to_string_pretty`）。
-- 迁移/删除文件出错必须显式返回错误。
+- JSON 写入保持可读（`serde_json::to_string_pretty`）。
+- 迁移/删除失败要显式返回错误。
 
-## 6) 业务约束（从当前实现提炼）
+## 8) 业务约束（来自当前实现）
 
-- 历史项按 `updated_at` 倒序。
+- 历史列表按 `updated_at` 倒序。
 - 去重键：`item_type + content_hash`。
-- 文本入库前做标准化（换行归一 + trim）。
-- 设置值范围：
-  - `poll_interval_ms`：300 ~ 5000
-  - `history_limit`：50 ~ 5000
-- 快捷键需清洗（如 `Meta` -> `Super`）。
+- 文本入库前标准化（换行统一 + trim）。
+- 设置边界：`poll_interval_ms` 300~5000，`history_limit` 50~5000。
+- 快捷键字符串会清洗（如 `Meta -> Super`）。
 
-## 7) Cursor/Copilot 规则检查
+## 9) Cursor / Copilot 规则
 
-以下规则文件当前未找到：
-
+当前未发现以下文件：
 - `.cursor/rules/`
 - `.cursorrules`
 - `.github/copilot-instructions.md`
 
-若后续新增这些文件，以其内容为更高优先级约束，并同步更新本节。
+若后续新增这些规则文件：
+- 其约束优先级高于本文件的通用建议；
+- 需同步更新本节并写明冲突处理策略。
 
-## 8) 代理执行建议（仓库定制）
+## 10) 代理执行清单
 
-1. 先读 `README.md` 与 `功能开发文档.md`，确认目标是 MVP 还是 V1。
-2. 动手前先确认命令存在；不存在就不要执行伪命令。
-3. 涉及持久化结构修改时，评估历史数据兼容与迁移风险。
-4. 涉及前后端协议变更时，前端 `invoke` 参数和 Rust 结构体同时调整。
-5. 提交前至少做一次运行验证：
-   - `npm run dev` 或 `npm run tauri dev`
-   - 改到构建链路时再跑 `npm run build` 或 `npm run tauri build`
+开始前：
+- 先读 `README.md` 与 `功能开发文档.md`。
+- 先确认将使用的脚本/命令真实存在。
 
-## 9) 维护要求
+进行中：
+- 只改与目标直接相关的文件。
+- 协议变更时同时更新前后端。
 
-- 新增 lint/test/typecheck/CI 后，第一时间更新第 2 节。
-- 引入 TS 或 lint 规则后，更新第 3~5 节并写清优先级。
-- 新增 Cursor/Copilot 规则后，更新第 7 节。
-- 保持文档“可执行、可验证、可追溯”，避免空泛描述。
+完成后：
+- 至少验证一条运行链路：`npm run dev` 或 `npm run tauri dev`。
+- 涉及构建链路时补跑：`npm run build` 或 `npm run tauri build`。

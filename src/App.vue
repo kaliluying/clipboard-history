@@ -11,6 +11,9 @@ const history = ref([]);
 const filter = ref("all");
 const keyword = ref("");
 const isPolling = ref(false);
+const isDraggingWindow = ref(false);
+const dragPollCooldownUntil = ref(0);
+const userInteractingUntil = ref(0);
 const pollIntervalMs = ref(DEFAULT_POLL_INTERVAL_MS);
 const notice = ref("");
 const shortcut = ref("Alt+Shift+V");
@@ -22,9 +25,47 @@ const storageDir = ref("");
 const imagePreviewMap = ref({});
 const previewLoadingMap = ref({});
 const expandedTextItem = ref(null);
+const copiedItemId = ref("");
+const copyBubble = ref({ visible: false, x: 0, y: 0, key: 0 });
 const appWindow = getCurrentWindow();
 
 let timer = null;
+let saveSettingsTimer = null;
+let copiedItemTimer = null;
+let copyBubbleTimer = null;
+let isHydratingSettings = true;
+
+function showCopyFeedback(itemId, mouseEvent) {
+  copiedItemId.value = itemId;
+  notice.value = "";
+
+  const x = mouseEvent?.clientX ?? window.innerWidth / 2;
+  const y = mouseEvent?.clientY ?? window.innerHeight / 2;
+  copyBubble.value = {
+    visible: true,
+    x,
+    y,
+    key: copyBubble.value.key + 1,
+  };
+
+  if (copyBubbleTimer !== null) {
+    window.clearTimeout(copyBubbleTimer);
+  }
+  copyBubbleTimer = window.setTimeout(() => {
+    copyBubble.value.visible = false;
+  }, 760);
+
+  if (copiedItemTimer !== null) {
+    window.clearTimeout(copiedItemTimer);
+  }
+  copiedItemTimer = window.setTimeout(() => {
+    copiedItemId.value = "";
+  }, 260);
+}
+
+function onUserInteraction() {
+  userInteractingUntil.value = Date.now() + 1000;
+}
 
 const visibleHistory = computed(() => {
   const q = keyword.value.trim().toLowerCase();
@@ -83,12 +124,26 @@ function keyToAccelerator(event) {
 }
 
 function startRecordShortcut() {
+  if (isRecordingShortcut.value) {
+    cancelRecordShortcut();
+    return;
+  }
   isRecordingShortcut.value = true;
   notice.value = "请按下新的快捷键组合";
 }
 
+function cancelRecordShortcut() {
+  isRecordingShortcut.value = false;
+  notice.value = "已取消快捷键录制";
+}
+
 function onShortcutKeydown(event) {
   if (!isRecordingShortcut.value) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelRecordShortcut();
+    return;
+  }
   event.preventDefault();
   const accelerator = keyToAccelerator(event);
   if (!accelerator) return;
@@ -178,11 +233,15 @@ async function startWindowDrag(event) {
   if (target.closest(nonDragSelector)) {
     return;
   }
+  isDraggingWindow.value = true;
   try {
     await appWindow.startDragging();
   } catch (error) {
     console.error("start dragging failed", error);
     notice.value = "窗口拖动失败，请检查权限配置";
+  } finally {
+    isDraggingWindow.value = false;
+    dragPollCooldownUntil.value = Date.now() + 350;
   }
 }
 
@@ -210,6 +269,9 @@ async function ensureImagePreview(item) {
 }
 
 async function pollClipboard() {
+  if (isDraggingWindow.value) return;
+  if (Date.now() < dragPollCooldownUntil.value) return;
+  if (Date.now() < userInteractingUntil.value) return;
   if (isPolling.value) return;
   isPolling.value = true;
 
@@ -248,13 +310,13 @@ async function copyItem(item, event) {
       const selectedText = getSelectedTextWithin(event.currentTarget);
       if (selectedText) {
         await invoke("copy_text", { text: selectedText });
-        notice.value = "";
+        showCopyFeedback(item.id, event);
         return;
       }
     }
 
     await invoke("copy_history_item", { id: item.id });
-    notice.value = "";
+    showCopyFeedback(item.id, event);
   } catch (error) {
     console.error("copy_history_item failed", error);
     notice.value = "回填失败";
@@ -325,13 +387,11 @@ async function clearAllHistory() {
 async function saveSettings() {
   const interval = Number(pollIntervalMs.value);
   if (!Number.isFinite(interval)) {
-    notice.value = "轮询间隔格式错误";
     return;
   }
 
   const newShortcut = shortcutDraft.value.trim();
   if (!newShortcut) {
-    notice.value = "快捷键不能为空";
     return;
   }
 
@@ -360,11 +420,21 @@ async function saveSettings() {
       void pollClipboard();
     }, pollIntervalMs.value);
 
-    notice.value = "设置已保存";
+    notice.value = "";
   } catch (error) {
     console.error("save settings failed", error);
     notice.value = "设置保存失败";
   }
+}
+
+function scheduleAutoSaveSettings() {
+  if (isHydratingSettings) return;
+  if (saveSettingsTimer !== null) {
+    window.clearTimeout(saveSettingsTimer);
+  }
+  saveSettingsTimer = window.setTimeout(() => {
+    void saveSettings();
+  }, 300);
 }
 
 onMounted(async () => {
@@ -375,11 +445,14 @@ onMounted(async () => {
   } catch (error) {
     console.error("initialization failed", error);
     notice.value = "初始化失败";
+  } finally {
+    isHydratingSettings = false;
   }
 
   timer = window.setInterval(() => {
     void pollClipboard();
   }, pollIntervalMs.value);
+
 });
 
 watch(
@@ -394,17 +467,41 @@ watch(
   { immediate: true }
 );
 
-onUnmounted(async () => {
+watch([pollIntervalMs, shortcutDraft, launchAtStartup, alwaysOnTop, storageDir], () => {
+  scheduleAutoSaveSettings();
+});
+
+onUnmounted(() => {
   if (timer !== null) {
     window.clearInterval(timer);
+  }
+  if (saveSettingsTimer !== null) {
+    window.clearTimeout(saveSettingsTimer);
+  }
+  if (copyNoticeTimer !== null) {
+    window.clearTimeout(copyNoticeTimer);
+  }
+  if (copiedItemTimer !== null) {
+    window.clearTimeout(copiedItemTimer);
+  }
+  if (copyBubbleTimer !== null) {
+    window.clearTimeout(copyBubbleTimer);
   }
 });
 </script>
 
 <template>
-  <main class="app-shell" @mousedown="startWindowDrag">
+  <main class="app-shell" @mousedown="startWindowDrag" @mousemove="onUserInteraction" @scroll.capture="onUserInteraction">
     <div class="ambient ambient-1" aria-hidden="true"></div>
     <div class="ambient ambient-2" aria-hidden="true"></div>
+    <div
+      v-if="copyBubble.visible"
+      :key="copyBubble.key"
+      class="copy-bubble"
+      :style="{ left: `${copyBubble.x}px`, top: `${copyBubble.y}px` }"
+    >
+      已复制
+    </div>
 
     <header class="titlebar panel">
       <div class="titlebar-name">Clipboard History</div>
@@ -444,7 +541,7 @@ onUnmounted(async () => {
                 placeholder="点击后按下组合键"
               />
               <button class="chip" @click="startRecordShortcut">
-                {{ isRecordingShortcut ? "录制中..." : "录入快捷键" }}
+                {{ isRecordingShortcut ? "取消录制" : "录入快捷键" }}
               </button>
             </div>
           </div>
@@ -492,7 +589,6 @@ onUnmounted(async () => {
 
           <div class="setting-actions bottom-setting-actions">
             <button class="chip danger" @click="clearAllHistory">删除全部历史</button>
-            <button class="chip save-btn" @click="saveSettings">保存设置</button>
           </div>
         </div>
       </template>
@@ -504,7 +600,7 @@ onUnmounted(async () => {
       <article
         v-for="item in visibleHistory"
         :key="item.id"
-        class="panel history-item"
+        :class="['panel', 'history-item', { copied: copiedItemId === item.id }]"
         @click="copyItem(item, $event)"
       >
         <header>
@@ -587,6 +683,12 @@ body {
   color: var(--text-main);
   background: linear-gradient(145deg, var(--bg-top), var(--bg-bottom));
   min-height: 100vh;
+  overflow-x: hidden;
+}
+
+html,
+#app {
+  overflow-x: hidden;
 }
 
 * {
@@ -614,6 +716,38 @@ body {
   padding: 8px 8px 10px;
   max-width: 450px;
   margin: 0 auto;
+  overflow-x: hidden;
+}
+
+.copy-bubble {
+  position: fixed;
+  z-index: 40;
+  pointer-events: none;
+  transform: translate(-50%, -115%);
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(14, 165, 233, 0.92);
+  color: #0b1020;
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: 0 8px 22px rgba(14, 165, 233, 0.4);
+  animation: copy-bubble-float 0.75s ease forwards;
+}
+
+@keyframes copy-bubble-float {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -95%) scale(0.92);
+  }
+  20% {
+    opacity: 1;
+    transform: translate(-50%, -115%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -155%) scale(0.98);
+  }
 }
 
 .titlebar {
@@ -891,6 +1025,23 @@ body {
   border-color: rgba(34, 211, 238, 0.45);
 }
 
+.history-item.copied {
+  animation: copied-pop 0.26s ease;
+  border-color: rgba(34, 211, 238, 0.62);
+}
+
+@keyframes copied-pop {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(0.985);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
 .history-item header {
   display: flex;
   justify-content: space-between;
@@ -926,6 +1077,8 @@ time {
   line-height: 1.5;
   color: #e2e8f0;
   user-select: text;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .text-expand-btn {
