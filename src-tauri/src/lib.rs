@@ -88,6 +88,7 @@ struct AppState {
     last_capture_fingerprint: Mutex<Option<String>>,
     history_lock: Mutex<()>,
     last_diagnostic_log_at: Mutex<u64>,
+    suppress_auto_hide_until: Mutex<u64>,
 }
 
 impl Default for AppState {
@@ -96,6 +97,7 @@ impl Default for AppState {
             last_capture_fingerprint: Mutex::new(None),
             history_lock: Mutex::new(()),
             last_diagnostic_log_at: Mutex::new(0),
+            suppress_auto_hide_until: Mutex::new(0),
         }
     }
 }
@@ -1386,6 +1388,16 @@ fn clear_history(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn suppress_auto_hide(state: State<AppState>) -> Result<(), String> {
+    let mut until = state
+        .suppress_auto_hide_until
+        .lock()
+        .map_err(|_| "自动隐藏抑制锁获取失败".to_string())?;
+    *until = now_ms().saturating_add(1500);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1452,6 +1464,21 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                return;
+            }
+
+            if let WindowEvent::Focused(false) = event {
+                if let Ok(until) = window
+                    .app_handle()
+                    .state::<AppState>()
+                    .suppress_auto_hide_until
+                    .lock()
+                {
+                    if now_ms() < *until {
+                        return;
+                    }
+                }
+                let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1466,7 +1493,8 @@ pub fn run() {
             copy_text,
             toggle_favorite,
             delete_history_item,
-            clear_history
+            clear_history,
+            suppress_auto_hide
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -239,6 +239,13 @@ async function startWindowDrag(event) {
     return;
   }
   isDraggingWindow.value = true;
+
+  try {
+    await invoke("suppress_auto_hide");
+  } catch (error) {
+    console.error("suppress auto hide failed", error);
+  }
+
   try {
     await appWindow.startDragging();
   } catch (error) {
