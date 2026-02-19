@@ -1661,26 +1661,99 @@ fn ws_get_local_ips() -> Vec<String> {
 
 fn get_local_ip_list() -> Vec<String> {
     let mut ips = Vec::new();
+
+    // 方法1：通过连接外部 DNS 获取实际出口 IP
     if let Ok(interfaces) = std::net::UdpSocket::bind("0.0.0.0:0") {
         if interfaces.connect("8.8.8.8:80").is_ok() {
             if let Ok(local) = interfaces.local_addr() {
-                ips.push(local.ip().to_string());
+                if let std::net::IpAddr::V4(ip) = local.ip() {
+                    // 过滤掉保留/特殊 IP
+                    if !ip.is_loopback() && !ip.is_unspecified() && !is_reserved_ip(ip) {
+                        ips.push(ip.to_string());
+                    }
+                }
             }
         }
     }
-    // 备用：枚举所有非 loopback IPv4 地址
-    if ips.is_empty() {
-        // 尝试通过 hostname 获取
-        if let Ok(hostname) = std::process::Command::new("hostname").output() {
-            let name = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
-            // 简单回退
-            let _ = name;
+
+    // 方法2：通过 ipconfig/ifconfig 获取
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("ipconfig").output() {
+            let output = String::from_utf8_lossy(&output.stdout);
+            for line in output.lines() {
+                let line = line.trim();
+                if line.starts_with("IPv4") || line.starts_with("IPv4 地址") {
+                    if let Some(ip) = extract_ip_from_line(line) {
+                        if is_private_ip(ip) && !ips.contains(&ip.to_string()) {
+                            ips.push(ip.to_string());
+                        }
+                    }
+                }
+            }
         }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(output) = std::process::Command::new("ifconfig").output() {
+            let output = String::from_utf8_lossy(&output.stdout);
+            for line in output.lines() {
+                if line.contains("inet ") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    for (i, part) in parts.iter().enumerate() {
+                        if *part == "inet" && i + 1 < parts.len() {
+                            let ip_str = parts[i + 1];
+                            if let Ok(ip) = ip_str.parse() {
+                                if is_private_ip(ip) && !ips.contains(&ip.to_string()) {
+                                    ips.push(ip.to_string());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 去重并过滤
+    ips.sort();
+    ips.dedup();
+    ips.retain(|ip| !ip.is_empty() && ip != "127.0.0.1");
+
     if ips.is_empty() {
         ips.push("127.0.0.1".to_string());
     }
     ips
+}
+
+fn extract_ip_from_line(line: &str) -> Option<std::net::Ipv4Addr> {
+    // 格式: "IPv4 地址 . . . . . . . . . . . : 192.168.1.100"
+    // 或: "IPv4 Address. . . . . . . . . . . . : 192.168.1.100"
+    if let Some(colon_pos) = line.rfind(':') {
+        let ip_part = line[colon_pos + 1..].trim();
+        if let Ok(ip) = ip_part.parse() {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+fn is_reserved_ip(ip: std::net::Ipv4Addr) -> bool {
+    // 198.18.x.x 和 198.19.x.x 是基准测试保留地址
+    // 169.254.x.x 是链路本地地址
+    ip.octets()[0] == 198 && (ip.octets()[1] == 18 || ip.octets()[1] == 19)
+        || ip.octets()[0] == 169 && ip.octets()[1] == 254
+}
+
+fn is_private_ip(ip: std::net::Ipv4Addr) -> bool {
+    // 10.x.x.x
+    ip.octets()[0] == 10
+    // 172.16-31.x.x
+    || (ip.octets()[0] == 172 && (16..=31).contains(&ip.octets()[1]))
+    // 192.168.x.x
+    || (ip.octets()[0] == 192 && ip.octets()[1] == 168)
 }
 
 /// 处理从 WebSocket 收到的剪切板消息（写入本地剪切板 + 记录历史）
