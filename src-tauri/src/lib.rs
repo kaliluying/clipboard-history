@@ -1,3 +1,6 @@
+mod ws_server;
+mod ws_client;
+
 use arboard::{Clipboard, ImageData};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -17,11 +20,13 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, PhysicalPosition, Position, State, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Position, State, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
+use tokio::sync::Mutex as TokioMutex;
+use uuid::Uuid;
 
 const HISTORY_FILE_NAME: &str = "clipboard-history.json";
 const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -38,10 +43,16 @@ struct AppSettings {
     global_shortcut: String,
     launch_at_startup: bool,
     always_on_top: bool,
+    device_name: String,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
+        // 获取默认设备名称
+        let device_name = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "我的电脑".to_string());
+
         Self {
             poll_interval_ms: 800,
             history_limit: 300,
@@ -49,6 +60,7 @@ impl Default for AppSettings {
             global_shortcut: "Alt+Shift+V".to_string(),
             launch_at_startup: false,
             always_on_top: false,
+            device_name,
         }
     }
 }
@@ -62,6 +74,7 @@ struct UpdateSettingsPayload {
     global_shortcut: Option<String>,
     launch_at_startup: Option<bool>,
     always_on_top: Option<bool>,
+    device_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +102,12 @@ struct AppState {
     history_lock: Mutex<()>,
     last_diagnostic_log_at: Mutex<u64>,
     suppress_auto_hide_until: Mutex<u64>,
+    /// WebSocket Server（Host 模式）
+    ws_server: TokioMutex<ws_server::WsServer>,
+    /// WebSocket Client（Peer 模式）
+    ws_client: TokioMutex<ws_client::WsClient>,
+    /// 本设备唯一 ID，用于过滤自己发出的消息回环
+    device_id: String,
 }
 
 impl Default for AppState {
@@ -98,6 +117,9 @@ impl Default for AppState {
             history_lock: Mutex::new(()),
             last_diagnostic_log_at: Mutex::new(0),
             suppress_auto_hide_until: Mutex::new(0),
+            ws_server: TokioMutex::new(ws_server::WsServer::new()),
+            ws_client: TokioMutex::new(ws_client::WsClient::new()),
+            device_id: Uuid::new_v4().to_string(),
         }
     }
 }
@@ -173,6 +195,13 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.global_shortcut = sanitize_shortcut(&settings.global_shortcut);
     if settings.global_shortcut.is_empty() {
         settings.global_shortcut = "Alt+Shift+V".to_string();
+    }
+    if settings.device_name.trim().is_empty() {
+        settings.device_name = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "我的电脑".to_string());
+    } else {
+        settings.device_name = settings.device_name.trim().to_string();
     }
     settings
 }
@@ -1014,6 +1043,9 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
     if let Some(v) = payload.always_on_top {
         next.always_on_top = v;
     }
+    if let Some(v) = payload.device_name {
+        next.device_name = v.trim().to_string();
+    }
     next = normalize_settings(next);
 
     save_settings(&app, &next)?;
@@ -1248,6 +1280,71 @@ fn poll_clipboard(app: AppHandle, state: State<AppState>) -> Result<Option<Clipb
         item.image_preview_data_url = build_image_preview_data_url(&app, item).ok().flatten();
     }
 
+    // 广播到 WebSocket peers（文本和图片，附带 device_id 防止回环）
+    if let Some(ref clipboard_item) = latest {
+        // 获取设备名称
+        let device_name = load_settings(&app)
+            .map(|s| s.device_name)
+            .unwrap_or_else(|_| "未知设备".to_string());
+
+        let msg: Option<String> = if clipboard_item.item_type == "text" {
+            if let Some(text) = &clipboard_item.text {
+                Some(serde_json::json!({
+                    "device_id": state.device_id,
+                    "device_name": device_name,
+                    "type": "text",
+                    "content": text,
+                    "timestamp": now_ms()
+                }).to_string())
+            } else {
+                None
+            }
+        } else if clipboard_item.item_type == "image" {
+            if let Some(rel_path) = &clipboard_item.image_path {
+                let full_path = data_dir(&app)?.join(rel_path);
+                if let Ok(img_bytes) = fs::read(&full_path) {
+                    let base64_data = BASE64.encode(&img_bytes);
+                    Some(serde_json::json!({
+                        "device_id": state.device_id,
+                        "device_name": device_name,
+                        "type": "image",
+                        "content": base64_data,
+                        "timestamp": now_ms()
+                    }).to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(msg) = msg {
+            // 尝试通过 Server 广播
+            let app_clone = app.clone();
+            let msg_clone = msg.clone();
+            let device_id_clone = state.device_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_clone.state::<AppState>();
+                // Server 广播
+                {
+                    let server = state.ws_server.lock().await;
+                    server.broadcast_text(msg_clone.clone()).await;
+                }
+                // Client 发送（如果处于 client 模式）
+                {
+                    let client = state.ws_client.lock().await;
+                    if client.is_connected() {
+                        let _ = client.send_text(msg_clone);
+                    }
+                }
+                drop(device_id_clone); // suppress unused warning
+            });
+        }
+    }
+
     Ok(latest)
 }
 
@@ -1398,7 +1495,300 @@ fn suppress_auto_hide(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+// ─── WebSocket 命令 ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WsStatus {
+    mode: String,          // "disabled" | "server" | "client"
+    running: bool,
+    peer_count: usize,
+    address: Option<String>,
+}
+
+/// 启动 WebSocket Server（Host 模式）
+#[tauri::command]
+async fn ws_start_server(
+    port: Option<u16>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<WsStatus, String> {
+    let port = port.unwrap_or(9521);
+    let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // 启动接收远端消息的后台任务（写入本机剪切板 + 插入历史）
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        while let Some(json) = app_rx.recv().await {
+            handle_received_clipboard(&app_clone, json).await;
+        }
+    });
+
+    let actual_port = {
+        let mut server = state.ws_server.lock().await;
+        server.start(port, app_tx).await?
+    };
+
+    let ips = get_local_ip_list();
+    let first_addr = ips
+        .first()
+        .map(|ip| format!("ws://{}:{}", ip, actual_port));
+
+    Ok(WsStatus {
+        mode: "server".to_string(),
+        running: true,
+        peer_count: 0,
+        address: first_addr,
+    })
+}
+
+/// 停止 WebSocket Server
+#[tauri::command]
+async fn ws_stop_server(state: State<'_, AppState>) -> Result<WsStatus, String> {
+    state.ws_server.lock().await.stop().await;
+    Ok(WsStatus {
+        mode: "disabled".to_string(),
+        running: false,
+        peer_count: 0,
+        address: None,
+    })
+}
+
+/// 作为 Client 连接到指定 Server
+#[tauri::command]
+async fn ws_connect_client(
+    url: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<WsStatus, String> {
+    let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // 启动接收远端消息的后台任务
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        while let Some(json) = app_rx.recv().await {
+            // 检查是否是内部断开/重连消息
+            if json == "__disconnected__" {
+                eprintln!("[ws] 连接断开");
+                let _ = app_clone.emit("ws-status-changed", serde_json::json!({
+                    "connected": false,
+                    "mode": "client"
+                }));
+                continue;
+            }
+            if json == "__reconnect_needed__" {
+                eprintln!("[ws] 需要重连...");
+                let _ = app_clone.emit("ws-reconnect-needed", ());
+                continue;
+            }
+            if json == "__reconnected__" {
+                eprintln!("[ws] 重连成功");
+                let _ = app_clone.emit("ws-status-changed", serde_json::json!({
+                    "connected": true,
+                    "mode": "client"
+                }));
+                continue;
+            }
+
+            handle_received_clipboard(&app_clone, json).await;
+        }
+    });
+
+    state.ws_client.lock().await.connect(&url, app_tx).await?;
+
+    Ok(WsStatus {
+        mode: "client".to_string(),
+        running: true,
+        peer_count: 0,
+        address: Some(url),
+    })
+}
+
+/// 断开 Client 连接
+#[tauri::command]
+async fn ws_disconnect_client(state: State<'_, AppState>) -> Result<WsStatus, String> {
+    state.ws_client.lock().await.disconnect().await;
+    Ok(WsStatus {
+        mode: "disabled".to_string(),
+        running: false,
+        peer_count: 0,
+        address: None,
+    })
+}
+
+/// 获取当前 WebSocket 状态
+#[tauri::command]
+async fn ws_get_status(state: State<'_, AppState>) -> Result<WsStatus, String> {
+    let server = state.ws_server.lock().await;
+    let client = state.ws_client.lock().await;
+
+    if server.is_running() {
+        let peer_count = server.peer_count().await;
+        let ips = get_local_ip_list();
+        // 获取实际端口
+        let port = server.get_port().await;
+        let address = ips.first().map(|ip| format!("ws://{}:{}", ip, port));
+        return Ok(WsStatus {
+            mode: "server".to_string(),
+            running: true,
+            peer_count,
+            address,
+        });
+    }
+
+    if client.is_connected() {
+        return Ok(WsStatus {
+            mode: "client".to_string(),
+            running: true,
+            peer_count: 0,
+            address: client.get_connected_url().await,
+        });
+    }
+
+    Ok(WsStatus {
+        mode: "disabled".to_string(),
+        running: false,
+        peer_count: 0,
+        address: None,
+    })
+}
+
+/// 获取本机局域网 IP 列表
+#[tauri::command]
+fn ws_get_local_ips() -> Vec<String> {
+    get_local_ip_list()
+}
+
+fn get_local_ip_list() -> Vec<String> {
+    let mut ips = Vec::new();
+    if let Ok(interfaces) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if interfaces.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local) = interfaces.local_addr() {
+                ips.push(local.ip().to_string());
+            }
+        }
+    }
+    // 备用：枚举所有非 loopback IPv4 地址
+    if ips.is_empty() {
+        // 尝试通过 hostname 获取
+        if let Ok(hostname) = std::process::Command::new("hostname").output() {
+            let name = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
+            // 简单回退
+            let _ = name;
+        }
+    }
+    if ips.is_empty() {
+        ips.push("127.0.0.1".to_string());
+    }
+    ips
+}
+
+/// 处理从 WebSocket 收到的剪切板消息（写入本地剪切板 + 记录历史）
+async fn handle_received_clipboard(app: &AppHandle, json: String) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return;
+    };
+
+    // 过滤自己发出的消息（通过 device_id）
+    let state = app.state::<AppState>();
+    if let Some(did) = value["device_id"].as_str() {
+        if did == state.device_id {
+            return;
+        }
+    }
+
+    let Some(content_type) = value["type"].as_str() else {
+        return;
+    };
+
+    if content_type == "text" {
+        let Some(text) = value["content"].as_str() else {
+            return;
+        };
+
+        // 写入本机剪切板
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(text.to_string());
+        }
+
+        // 更新指纹，避免 poll_clipboard 重复采集
+        let normalized = normalize_text(text);
+        let item = to_text_item(normalized.clone());
+        let fp = fingerprint(&item);
+        if let Ok(mut last) = state.last_capture_fingerprint.lock() {
+            *last = Some(fp);
+        }
+
+        // 插入历史记录
+        if let Ok(settings) = load_settings(app) {
+            if let Ok(mut items) = load_history(app) {
+                dedupe_and_upsert(&mut items, item, settings.history_limit);
+                let _ = save_history(app, &items);
+            }
+        }
+
+        // 通知前端刷新
+        let _ = app.emit("clipboard-synced", ());
+    } else if content_type == "image" {
+        let Some(base64_data) = value["content"].as_str() else {
+            return;
+        };
+
+        // 解码 base64 图片
+        let Ok(img_bytes) = BASE64.decode(base64_data) else {
+            return;
+        };
+
+        // 加载图片验证格式
+        let Ok(dyn_img) = image::load_from_memory(&img_bytes) else {
+            return;
+        };
+
+        // 转换为 RGBA 并创建 ClipboardItem
+        let rgba = dyn_img.to_rgba8();
+        let width = rgba.width();
+        let height = rgba.height();
+        let rgba_bytes = rgba.into_raw();
+
+        match image_item_from_rgba_bytes(app, width, height, rgba_bytes) {
+            Ok(item) => {
+                // 写入本机剪切板
+                if let Some(rel_path) = &item.image_path {
+                    let full_path = data_dir(app).ok().map(|d| d.join(rel_path));
+                    if let Some(path) = full_path {
+                        if let Ok(img_data) = load_image_for_clipboard(&path) {
+                            if let Ok(mut cb) = arboard::Clipboard::new() {
+                                let _ = cb.set_image(img_data);
+                            }
+                        }
+                    }
+                }
+
+                // 更新指纹，避免 poll_clipboard 重复采集
+                let fp = fingerprint(&item);
+                if let Ok(mut last) = state.last_capture_fingerprint.lock() {
+                    *last = Some(fp);
+                }
+
+                // 插入历史记录
+                if let Ok(settings) = load_settings(app) {
+                    if let Ok(mut items) = load_history(app) {
+                        dedupe_and_upsert(&mut items, item, settings.history_limit);
+                        let _ = save_history(app, &items);
+                    }
+                }
+
+                // 通知前端刷新
+                let _ = app.emit("clipboard-synced", ());
+            }
+            Err(e) => {
+                eprintln!("[ws] failed to create image item: {}", e);
+            }
+        }
+    }
+}
+
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -1494,7 +1884,13 @@ pub fn run() {
             toggle_favorite,
             delete_history_item,
             clear_history,
-            suppress_auto_hide
+            suppress_auto_hide,
+            ws_start_server,
+            ws_stop_server,
+            ws_connect_client,
+            ws_disconnect_client,
+            ws_get_status,
+            ws_get_local_ips
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

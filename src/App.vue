@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 
 const DEFAULT_POLL_INTERVAL_MS = 800;
 
@@ -22,6 +23,7 @@ const isRecordingShortcut = ref(false);
 const launchAtStartup = ref(false);
 const alwaysOnTop = ref(false);
 const storageDir = ref("");
+const deviceName = ref("");
 const imagePreviewMap = ref({});
 const previewLoadingMap = ref({});
 const expandedTextItem = ref(null);
@@ -36,6 +38,122 @@ let copiedItemTimer = null;
 let copyBubbleTimer = null;
 let clearHistoryConfirmTimer = null;
 let isHydratingSettings = true;
+let unlistenClipboardSynced = null;
+let unlistenWsStatusChanged = null;
+let unlistenWsReconnectNeeded = null;
+
+// WebSocket 局域网共享
+const wsMode = ref("disabled"); // "disabled" | "server" | "client"
+const wsPort = ref(9521);
+const wsUrl = ref("");
+const wsRunning = ref(false);
+const wsPeerCount = ref(0);
+const wsAddress = ref("");
+const wsLocalIps = ref([]);
+const wsLoading = ref(false);
+const wsAutoReconnect = ref(true);
+
+async function loadLocalIps() {
+  try {
+    wsLocalIps.value = await invoke("ws_get_local_ips");
+    if (wsLocalIps.value.length > 0 && !wsUrl.value) {
+      wsUrl.value = `ws://${wsLocalIps.value[0]}:${wsPort.value}`;
+    }
+  } catch (e) {
+    console.error("ws_get_local_ips failed", e);
+  }
+}
+
+async function loadWsStatus() {
+  try {
+    const status = await invoke("ws_get_status");
+    wsMode.value = status.mode;
+    wsRunning.value = status.running;
+    wsPeerCount.value = status.peerCount;
+    wsAddress.value = status.address || "";
+    // 如果是客户端模式且有地址，同步到 wsUrl
+    if (status.mode === "client" && status.address) {
+      wsUrl.value = status.address;
+    }
+  } catch (e) {
+    console.error("ws_get_status failed", e);
+  }
+}
+
+async function wsStartServer() {
+  wsLoading.value = true;
+  try {
+    const status = await invoke("ws_start_server", { port: wsPort.value });
+    wsRunning.value = status.running;
+    wsAddress.value = status.address || "";
+    notice.value = `已启动，其它设备连接地址：${wsAddress.value}`;
+  } catch (e) {
+    notice.value = `启动失败：${e}`;
+  } finally {
+    wsLoading.value = false;
+  }
+}
+
+async function wsStopServer() {
+  wsLoading.value = true;
+  try {
+    await invoke("ws_stop_server");
+    wsRunning.value = false;
+    wsAddress.value = "";
+    notice.value = "已停止 WebSocket 服务";
+  } catch (e) {
+    notice.value = `停止失败：${e}`;
+  } finally {
+    wsLoading.value = false;
+  }
+}
+
+async function wsConnectClient() {
+  if (!wsUrl.value.trim()) {
+    notice.value = "请填写服务器地址";
+    return;
+  }
+  wsLoading.value = true;
+  try {
+    const status = await invoke("ws_connect_client", { url: wsUrl.value.trim() });
+    wsRunning.value = status.running;
+    notice.value = `已连接到：${wsUrl.value}`;
+  } catch (e) {
+    notice.value = `连接失败：${e}`;
+  } finally {
+    wsLoading.value = false;
+  }
+}
+
+async function wsDisconnectClient() {
+  wsLoading.value = true;
+  try {
+    await invoke("ws_disconnect_client");
+    wsRunning.value = false;
+    notice.value = "已断开连接";
+  } catch (e) {
+    notice.value = `断开失败：${e}`;
+  } finally {
+    wsLoading.value = false;
+  }
+}
+
+async function wsReconnect() {
+  if (!wsUrl.value.trim()) {
+    notice.value = "请填写服务器地址";
+    return;
+  }
+  wsLoading.value = true;
+  try {
+    const status = await invoke("ws_connect_client", { url: wsUrl.value.trim() });
+    wsRunning.value = status.running;
+    notice.value = `正在重连...`;
+  } catch (e) {
+    notice.value = `重连失败：${e}`;
+  } finally {
+    wsLoading.value = false;
+  }
+}
 
 function showCopyFeedback(itemId, mouseEvent) {
   copiedItemId.value = itemId;
@@ -174,6 +292,9 @@ async function loadSettings() {
   }
   if (settings && typeof settings.storageDir === "string") {
     storageDir.value = settings.storageDir;
+  }
+  if (settings && typeof settings.deviceName === "string") {
+    deviceName.value = settings.deviceName;
   }
 }
 
@@ -431,6 +552,7 @@ async function saveSettings() {
         launchAtStartup: launchAtStartup.value,
         alwaysOnTop: alwaysOnTop.value,
         storageDir: storageDir.value.trim(),
+        deviceName: deviceName.value.trim(),
       },
     });
 
@@ -440,6 +562,7 @@ async function saveSettings() {
     launchAtStartup.value = settings.launchAtStartup;
     alwaysOnTop.value = settings.alwaysOnTop;
     storageDir.value = settings.storageDir || "";
+    deviceName.value = settings.deviceName || "";
 
     if (timer !== null) {
       window.clearInterval(timer);
@@ -485,6 +608,38 @@ onMounted(async () => {
     void pollClipboard();
   }, pollIntervalMs.value);
 
+  // 监听来自其它设备的剪切板事件
+  unlistenClipboardSynced = await listen("clipboard-synced", async () => {
+    await loadHistory();
+  });
+
+  // 监听 WebSocket 连接状态变化
+  unlistenWsStatusChanged = await listen("ws-status-changed", async (event) => {
+    const data = event.payload;
+    if (data.mode === "client") {
+      wsRunning.value = data.connected;
+      if (data.connected) {
+        notice.value = "已重新连接到服务器";
+      } else {
+        notice.value = "连接已断开";
+      }
+    }
+  });
+
+  // 监听需要重连的事件
+  unlistenWsReconnectNeeded = await listen("ws-reconnect-needed", async () => {
+    if (wsAutoReconnect.value && wsUrl.value) {
+      notice.value = "连接断开，正在尝试重连...";
+      // 自动重连
+      setTimeout(async () => {
+        await wsReconnect();
+      }, 2000);
+    }
+  });
+
+  // 加载本机 IP 和 WebSocket 状态
+  await loadLocalIps();
+  await loadWsStatus();
 });
 
 watch(
@@ -499,7 +654,7 @@ watch(
   { immediate: true }
 );
 
-watch([pollIntervalMs, shortcutDraft, launchAtStartup, alwaysOnTop, storageDir], () => {
+watch([pollIntervalMs, shortcutDraft, launchAtStartup, alwaysOnTop, storageDir, deviceName], () => {
   scheduleAutoSaveSettings();
 });
 
@@ -521,6 +676,15 @@ onUnmounted(() => {
   }
   if (clearHistoryConfirmTimer !== null) {
     window.clearTimeout(clearHistoryConfirmTimer);
+  }
+  if (unlistenClipboardSynced) {
+    unlistenClipboardSynced();
+  }
+  if (unlistenWsStatusChanged) {
+    unlistenWsStatusChanged();
+  }
+  if (unlistenWsReconnectNeeded) {
+    unlistenWsReconnectNeeded();
   }
 });
 </script>
@@ -620,10 +784,85 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <div class="setting-row setting-inline">
+            <label>设备名称</label>
+            <input
+              v-model="deviceName"
+              class="search compact-input"
+              placeholder="用于局域网识别"
+              style="min-width:120px"
+            />
+          </div>
+
           <div class="setting-actions bottom-setting-actions">
             <button class="chip danger" :class="{ 'danger-confirm': isClearHistoryConfirming }" @click="clearAllHistory">
               {{ isClearHistoryConfirming ? "再次点击确认删除" : "删除全部历史" }}
             </button>
+          </div>
+
+          <!-- 局域网剪切板共享 -->
+          <div class="setting-section">
+            <h3 class="setting-section-title">📶 局域网共享</h3>
+
+            <div class="setting-row setting-inline">
+              <label>模式</label>
+              <div class="ws-mode-btns">
+                <button :class="['chip', { active: wsMode === 'disabled' }]" @click="wsMode = 'disabled'">禁用</button>
+                <button :class="['chip', { active: wsMode === 'server' }]" @click="wsMode = 'server'">作为主机</button>
+                <button :class="['chip', { active: wsMode === 'client' }]" @click="wsMode = 'client'">加入主机</button>
+              </div>
+            </div>
+
+            <template v-if="wsMode === 'server'">
+              <div class="setting-row setting-inline">
+                <label>端口</label>
+                <input v-model.number="wsPort" class="search compact-input" type="number" min="1024" max="65535" style="width:90px" />
+              </div>
+              <div class="setting-row">
+                <div class="setting-actions">
+                  <button v-if="!wsRunning" class="chip" :disabled="wsLoading" @click="wsStartServer">
+                    {{ wsLoading ? '启动中...' : '启动' }}
+                  </button>
+                  <button v-else class="chip danger" :disabled="wsLoading" @click="wsStopServer">
+                    {{ wsLoading ? '停止中...' : '停止服务' }}
+                  </button>
+                </div>
+              </div>
+              <div v-if="wsRunning && wsAddress" class="ws-address-box">
+                <span class="ws-label">其它设备输入：</span>
+                <code class="ws-addr">{{ wsAddress }}</code>
+              </div>
+            </template>
+
+            <template v-if="wsMode === 'client'">
+              <div class="setting-row setting-inline">
+                <label>服务器地址</label>
+                <input
+                  v-model="wsUrl"
+                  class="search compact-input"
+                  placeholder="ws://192.168.1.x:9521"
+                  style="min-width:180px"
+                />
+              </div>
+              <div v-if="wsLocalIps.length" class="ws-ips">
+                <span class="ws-label">本机 IP：</span>
+                <code v-for="ip in wsLocalIps" :key="ip" class="ws-addr" style="margin-right:6px">{{ ip }}</code>
+              </div>
+              <div class="setting-row">
+                <div class="setting-actions">
+                  <button v-if="!wsRunning" class="chip" :disabled="wsLoading" @click="wsConnectClient">
+                    {{ wsLoading ? '连接中...' : '连接' }}
+                  </button>
+                  <button v-else class="chip danger" :disabled="wsLoading" @click="wsDisconnectClient">
+                    {{ wsLoading ? '断开中...' : '断开' }}
+                  </button>
+                </div>
+              </div>
+              <div class="ws-status-row">
+                <span class="ws-dot" :class="{ connected: wsRunning }"></span>
+                <span>{{ wsRunning ? '已连接' : '未连接' }}</span>
+              </div>
+            </template>
           </div>
         </div>
       </template>
@@ -1313,5 +1552,75 @@ time {
     flex-wrap: nowrap;
     justify-content: flex-end;
   }
+}
+</style>
+
+<style>
+/* WebSocket 局域网共享样式 */
+.setting-section {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.setting-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-soft);
+  margin: 0 0 8px;
+  letter-spacing: 0.03em;
+}
+
+.ws-mode-btns {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ws-address-box,
+.ws-ips {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 8px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ws-label {
+  color: var(--text-soft);
+  flex-shrink: 0;
+}
+
+.ws-addr {
+  color: var(--accent);
+  font-family: monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.ws-status-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+
+.ws-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.25);
+  flex-shrink: 0;
+}
+
+.ws-dot.connected {
+  background: #22d3ee;
+  box-shadow: 0 0 6px rgba(34,211,238,0.7);
 }
 </style>
