@@ -50,19 +50,46 @@ const wsRunning = ref(false);
 const wsPeerCount = ref(0);
 const wsAddress = ref("");
 const wsLocalIps = ref([]);
+const wsSelectedIp = ref("");
 const wsLoading = ref(false);
 const wsAutoReconnect = ref(true);
 
 async function loadLocalIps() {
   try {
     wsLocalIps.value = await invoke("ws_get_local_ips");
-    if (wsLocalIps.value.length > 0 && !wsUrl.value) {
-      wsUrl.value = `ws://${wsLocalIps.value[0]}:${wsPort.value}`;
+    if (wsLocalIps.value.length > 0) {
+      // 设置默认选中第一个 IP
+      if (!wsSelectedIp.value) {
+        wsSelectedIp.value = wsLocalIps.value[0];
+      }
+      if (!wsUrl.value) {
+        wsUrl.value = `ws://${wsSelectedIp.value}:${wsPort.value}`;
+      }
     }
   } catch (e) {
     console.error("ws_get_local_ips failed", e);
   }
 }
+
+// 监听选中的 IP 变化，更新客户端连接地址
+watch(wsSelectedIp, (newIp) => {
+  if (newIp) {
+    if (wsMode.value === "client") {
+      wsUrl.value = `ws://${newIp}:${wsPort.value}`;
+    } else if (wsMode.value === "server" && wsRunning.value) {
+      // 服务器运行时更新显示的地址
+      wsAddress.value = `ws://${newIp}:${wsPort.value}`;
+    }
+  }
+});
+
+// 监听模式变化，确保 IP 选择正确
+watch(wsMode, (newMode) => {
+  if (newMode === "server" && wsSelectedIp.value && wsRunning.value) {
+    // 切换回服务器模式时，确保显示正确的地址
+    wsAddress.value = `ws://${wsSelectedIp.value}:${wsPort.value}`;
+  }
+});
 
 async function loadWsStatus() {
   try {
@@ -85,7 +112,12 @@ async function wsStartServer() {
   try {
     const status = await invoke("ws_start_server", { port: wsPort.value });
     wsRunning.value = status.running;
-    wsAddress.value = status.address || "";
+    // 如果用户选择了 IP，使用用户选择的 IP；否则使用后端返回的地址
+    if (wsSelectedIp.value) {
+      wsAddress.value = `ws://${wsSelectedIp.value}:${wsPort.value}`;
+    } else {
+      wsAddress.value = status.address || "";
+    }
     notice.value = `已启动，其它设备连接地址：${wsAddress.value}`;
   } catch (e) {
     notice.value = `启动失败：${e}`;
@@ -817,6 +849,16 @@ onUnmounted(() => {
               <div class="setting-row setting-inline">
                 <label>端口</label>
                 <input v-model.number="wsPort" class="search compact-input" type="number" min="1024" max="65535" style="width:90px" />
+              </div>
+              <div v-if="wsLocalIps.length > 1" class="setting-row setting-inline">
+                <label>绑定IP</label>
+                <select v-model="wsSelectedIp" class="search compact-input" style="min-width:150px">
+                  <option v-for="ip in wsLocalIps" :key="ip" :value="ip">{{ ip }}</option>
+                </select>
+              </div>
+              <div v-else-if="wsLocalIps.length === 1" class="setting-row setting-inline">
+                <label>绑定IP</label>
+                <code class="ws-addr" style="margin-left:4px">{{ wsLocalIps[0] }}</code>
               </div>
               <div class="setting-row">
                 <div class="setting-actions">
