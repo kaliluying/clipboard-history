@@ -1,8 +1,8 @@
 [package]
 name = "clipboard-history"
-version = "0.2"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.2.0"
+description = "基于 Tauri 的桌面剪贴板历史工具，支持文本和图片管理、关键字搜索、收藏、局域网同步"
+authors = ["kaliluying"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
