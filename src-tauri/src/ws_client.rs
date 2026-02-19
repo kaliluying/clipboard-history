@@ -23,16 +23,6 @@ impl WsClient {
         }
     }
 
-    /// 启用/禁用自动重连
-    pub fn set_auto_reconnect(&self, enabled: bool) {
-        self.auto_reconnect.store(enabled, Ordering::SeqCst);
-    }
-
-    /// 获取自动重连是否启用
-    pub fn is_auto_reconnect_enabled(&self) -> bool {
-        self.auto_reconnect.load(Ordering::SeqCst)
-    }
-
     /// 连接到 WebSocket Server
     /// - `url`: 形如 `ws://192.168.1.5:9521`
     /// - `app_tx`: 收到远端消息时，通过此 channel 通知 app 层
@@ -41,8 +31,9 @@ impl WsClient {
         url: &str,
         app_tx: mpsc::UnboundedSender<String>,
     ) -> Result<(), String> {
+        // 如果已有连接，先断开清理
         if self.shutdown_tx.is_some() {
-            return Err("已有连接，请先断开".to_string());
+            self.disconnect().await;
         }
 
         // 启用自动重连
