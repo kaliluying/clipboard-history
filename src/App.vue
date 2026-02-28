@@ -241,9 +241,35 @@ const visibleHistory = computed(() => {
 });
 
 function upsertTop(item) {
+  const prevImageCount = storageStats.value.imageCount;
   const idx = history.value.findIndex((it) => it.id === item.id);
   if (idx >= 0) history.value.splice(idx, 1);
   history.value.unshift(item);
+  // Update storage stats
+  updateStorageStats();
+  // Update image storage size from backend when new image is added
+  if (item.type === 'image' && storageStats.value.imageCount > prevImageCount) {
+    loadStorageStats();
+  }
+}
+
+async function loadStorageStats() {
+  try {
+    storageStats.value = await invoke("get_storage_stats");
+  } catch (e) {
+    console.error("load storage stats failed", e);
+  }
+}
+
+function updateStorageStats() {
+  const items = history.value;
+  storageStats.value = {
+    historyCount: items.length,
+    textCount: items.filter(i => i.type === 'text').length,
+    imageCount: items.filter(i => i.type === 'image').length,
+    favoriteCount: items.filter(i => i.isFavorite).length,
+    imageStorageBytes: storageStats.value.imageStorageBytes || 0
+  };
 }
 
 function formatTime(ms) {
@@ -445,6 +471,7 @@ async function startWindowDrag(event) {
 async function loadHistory() {
   const data = await invoke("get_history");
   history.value = Array.isArray(data) ? data : [];
+  loadStorageStats();
 }
 
 async function ensureImagePreview(item) {
@@ -557,10 +584,15 @@ async function toggleFavorite(item) {
 
 async function deleteItem(item) {
   try {
+    const wasImage = item.type === 'image';
     await invoke("delete_history_item", { id: item.id });
     history.value = history.value.filter((it) => it.id !== item.id);
     delete imagePreviewMap.value[item.id];
     delete previewLoadingMap.value[item.id];
+    updateStorageStats();
+    if (wasImage) {
+      loadStorageStats();
+    }
     notice.value = "";
   } catch (error) {
     console.error("delete_history_item failed", error);
@@ -588,6 +620,8 @@ async function clearAllHistory() {
     history.value = [];
     imagePreviewMap.value = {};
     previewLoadingMap.value = {};
+    updateStorageStats();
+    loadStorageStats();
     notice.value = "已删除全部历史";
   } catch (error) {
     console.error("clear_history failed", error);
