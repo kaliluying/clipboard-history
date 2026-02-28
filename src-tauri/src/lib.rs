@@ -44,6 +44,9 @@ struct AppSettings {
     launch_at_startup: bool,
     always_on_top: bool,
     device_name: String,
+    text_retention_days: u32,
+    image_retention_days: u32,
+    max_storage_mb: u32,
 }
 
 impl Default for AppSettings {
@@ -61,6 +64,9 @@ impl Default for AppSettings {
             launch_at_startup: false,
             always_on_top: false,
             device_name,
+            text_retention_days: 30,
+            image_retention_days: 7,
+            max_storage_mb: 500,
         }
     }
 }
@@ -75,6 +81,19 @@ struct UpdateSettingsPayload {
     launch_at_startup: Option<bool>,
     always_on_top: Option<bool>,
     device_name: Option<String>,
+    text_retention_days: Option<u32>,
+    image_retention_days: Option<u32>,
+    max_storage_mb: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageStats {
+    history_count: usize,
+    text_count: usize,
+    image_count: usize,
+    favorite_count: usize,
+    image_storage_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +210,9 @@ fn sanitize_shortcut(shortcut: &str) -> String {
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.poll_interval_ms = settings.poll_interval_ms.clamp(300, 5000);
     settings.history_limit = settings.history_limit.clamp(50, 5000);
+    settings.text_retention_days = settings.text_retention_days.clamp(0, 365);
+    settings.image_retention_days = settings.image_retention_days.clamp(0, 365);
+    settings.max_storage_mb = settings.max_storage_mb.clamp(0, 10000);
     settings.storage_dir = settings.storage_dir.trim().to_string();
     settings.global_shortcut = sanitize_shortcut(&settings.global_shortcut);
     if settings.global_shortcut.is_empty() {
@@ -523,10 +545,11 @@ fn load_history(app: &AppHandle) -> Result<Vec<ClipboardItem>, String> {
     Ok(items)
 }
 
-fn clean_history(items: Vec<ClipboardItem>, history_limit: usize) -> Vec<ClipboardItem> {
+fn clean_history(items: Vec<ClipboardItem>, settings: &AppSettings) -> Vec<ClipboardItem> {
     let mut sorted = items;
     sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
+    // Step 1: Deduplicate while preserving favorites
     let mut cleaned: Vec<ClipboardItem> = Vec::new();
     for mut item in sorted {
         if item.item_type == "text" {
@@ -552,20 +575,64 @@ fn clean_history(items: Vec<ClipboardItem>, history_limit: usize) -> Vec<Clipboa
         }
     }
 
+    // Step 2: Time-based cleanup (preserve favorites always)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let text_cutoff = if settings.text_retention_days > 0 {
+        now - (settings.text_retention_days as u64 * 86400)
+    } else {
+        0
+    };
+
+    let image_cutoff = if settings.image_retention_days > 0 {
+        now - (settings.image_retention_days as u64 * 86400)
+    } else {
+        0
+    };
+
+    cleaned.retain(|item| {
+        if item.is_favorite {
+            return true;
+        }
+        if item.item_type == "text" {
+            text_cutoff == 0 || item.updated_at > text_cutoff
+        } else {
+            image_cutoff == 0 || item.updated_at > image_cutoff
+        }
+    });
+
+    // Step 3: Quantity limit (only applies to non-favorites)
+    // Sort by time descending (newest first), keep this order
     cleaned.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    if cleaned.len() > history_limit {
-        cleaned.truncate(history_limit);
-    }
-    cleaned
+
+    // Keep all favorites, truncate oldest non-favorites
+    let favorites: Vec<ClipboardItem> = cleaned.iter().filter(|i| i.is_favorite).cloned().collect();
+    let mut non_favorites: Vec<ClipboardItem> = cleaned.iter().filter(|i| !i.is_favorite).cloned().collect();
+
+    let remaining_slots = settings.history_limit.saturating_sub(favorites.len());
+    non_favorites.truncate(remaining_slots);
+
+    // Combine while preserving time order: non-favorites first (newest), then favorites
+    let mut result = non_favorites;
+    result.extend(favorites);
+    // Re-sort to ensure time order
+    result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    result
 }
 
 fn load_history_clean(app: &AppHandle) -> Result<Vec<ClipboardItem>, String> {
     let settings = load_settings(app)?;
     let items = load_history(app)?;
-    let mut cleaned = clean_history(items, settings.history_limit);
+    let mut cleaned = clean_history(items, &settings);
     for item in &mut cleaned {
         item.image_preview_data_url = None;
     }
+    // Clean up orphaned images
+    let _ = cleanup_orphaned_images(app, &cleaned);
     Ok(cleaned)
 }
 
@@ -962,7 +1029,7 @@ fn fingerprint_from_current_clipboard() -> Option<String> {
 fn dedupe_and_upsert(
     items: &mut Vec<ClipboardItem>,
     incoming: ClipboardItem,
-    history_limit: usize,
+    settings: &AppSettings,
 ) {
     if let Some(idx) = items.iter().position(|it| {
         it.item_type == incoming.item_type && it.content_hash == incoming.content_hash
@@ -977,8 +1044,21 @@ fn dedupe_and_upsert(
         items.insert(0, incoming);
     }
 
-    if items.len() > history_limit {
-        items.truncate(history_limit);
+    // Apply quantity limit: keep all favorites, truncate oldest non-favorites
+    // Items are already sorted newest-first
+    if items.len() > settings.history_limit {
+        // Keep all favorites, keep newest non-favorites
+        let favorites: Vec<ClipboardItem> = items.iter().filter(|i| i.is_favorite).cloned().collect();
+        let mut non_favorites: Vec<ClipboardItem> = items.iter().filter(|i| !i.is_favorite).cloned().collect();
+
+        let keep_non_favorites = settings.history_limit.saturating_sub(favorites.len());
+        non_favorites.truncate(keep_non_favorites);
+
+        // Combine and re-sort by updated_at descending
+        let mut result = favorites;
+        result.extend(non_favorites);
+        result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        *items = result;
     }
 }
 
@@ -1008,6 +1088,80 @@ fn get_storage_dir_path(app: AppHandle) -> Result<String, String> {
     ensure_storage_layout(&app)?;
     let dir = data_dir(&app)?;
     Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn get_storage_stats(app: AppHandle) -> Result<StorageStats, String> {
+    ensure_storage_layout(&app)?;
+    let items = load_history(&app)?;
+
+    let history_count = items.len();
+    let text_count = items.iter().filter(|i| i.item_type == "text").count();
+    let image_count = items.iter().filter(|i| i.item_type == "image").count();
+    let favorite_count = items.iter().filter(|i| i.is_favorite).count();
+
+    // Calculate image storage size
+    let image_dir = data_dir(&app)?.join(IMAGE_DIR_NAME);
+    let image_storage_bytes = if image_dir.exists() {
+        calculate_dir_size(&image_dir)
+    } else {
+        0
+    };
+
+    Ok(StorageStats {
+        history_count,
+        text_count,
+        image_count,
+        favorite_count,
+        image_storage_bytes,
+    })
+}
+
+fn calculate_dir_size(path: &Path) -> u64 {
+    if path.is_file() {
+        return path.metadata().map(|m| m.len()).unwrap_or(0);
+    }
+    if !path.is_dir() {
+        return 0;
+    }
+    let mut total: u64 = 0;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            total += calculate_dir_size(&entry.path());
+        }
+    }
+    total
+}
+
+fn cleanup_orphaned_images(app: &AppHandle, items: &[ClipboardItem]) -> Result<(), String> {
+    let image_dir = data_dir(app)?.join(IMAGE_DIR_NAME);
+    if !image_dir.exists() {
+        return Ok(());
+    }
+
+    // Get image content hashes from history (file names are first 24 chars of hash)
+    let image_hashes: std::collections::HashSet<String> = items
+        .iter()
+        .filter(|i| i.item_type == "image")
+        .map(|i| i.content_hash[0..24].to_string())
+        .collect();
+
+    // Delete orphaned images
+    if let Ok(entries) = fs::read_dir(&image_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(stem) = path.file_stem() {
+                    let hash = stem.to_string_lossy().to_string();
+                    if !image_hashes.contains(&hash) {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -1046,9 +1200,24 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
     if let Some(v) = payload.device_name {
         next.device_name = v.trim().to_string();
     }
+    if let Some(v) = payload.text_retention_days {
+        next.text_retention_days = v;
+    }
+    if let Some(v) = payload.image_retention_days {
+        next.image_retention_days = v;
+    }
+    if let Some(v) = payload.max_storage_mb {
+        next.max_storage_mb = v;
+    }
     next = normalize_settings(next);
 
     save_settings(&app, &next)?;
+
+    // Apply cleanup after settings changed
+    let mut items = load_history(&app)?;
+    items = clean_history(items, &next);
+    save_history(&app, &items)?;
+    cleanup_orphaned_images(&app, &items)?;
 
     let new_dir = data_dir_from_settings(&app, &next)?;
     migrate_storage_if_needed(&old_dir, &new_dir)?;
@@ -1259,7 +1428,7 @@ fn poll_clipboard(app: AppHandle, state: State<AppState>) -> Result<Option<Clipb
 
     let settings = load_settings(&app)?;
     let mut items = load_history(&app)?;
-    dedupe_and_upsert(&mut items, item, settings.history_limit);
+    dedupe_and_upsert(&mut items, item, &settings);
     save_history(&app, &items)?;
     let item_type = &items[0].item_type;
     if capture_debug.is_empty() {
@@ -1344,6 +1513,9 @@ fn poll_clipboard(app: AppHandle, state: State<AppState>) -> Result<Option<Clipb
             });
         }
     }
+
+    // 通知前端刷新
+    let _ = app.emit("clipboard-synced", ());
 
     Ok(latest)
 }
@@ -1795,7 +1967,7 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
         // 插入历史记录
         if let Ok(settings) = load_settings(app) {
             if let Ok(mut items) = load_history(app) {
-                dedupe_and_upsert(&mut items, item, settings.history_limit);
+                dedupe_and_upsert(&mut items, item, &settings);
                 let _ = save_history(app, &items);
             }
         }
@@ -1846,7 +2018,7 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
                 // 插入历史记录
                 if let Ok(settings) = load_settings(app) {
                     if let Ok(mut items) = load_history(app) {
-                        dedupe_and_upsert(&mut items, item, settings.history_limit);
+                        dedupe_and_upsert(&mut items, item, &settings);
                         let _ = save_history(app, &items);
                     }
                 }
@@ -1947,6 +2119,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             get_storage_dir_path,
+            get_storage_stats,
             open_storage_dir,
             update_settings,
             get_history,

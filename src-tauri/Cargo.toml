@@ -1,6 +1,6 @@
 [package]
 name = "clipboard-history"
-version = "0.2.0"
+version = "0.2.1"
 description = "基于 Tauri 的桌面剪贴板历史工具，支持文本和图片管理、关键字搜索、收藏、局域网同步"
 authors = ["kaliluying"]
 edition = "2021"

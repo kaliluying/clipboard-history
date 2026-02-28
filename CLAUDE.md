@@ -23,7 +23,7 @@ npm run tauri dev
 npm run tauri build
 ```
 
-**Note**: No lint/test/typecheck scripts are currently configured. See AGENTS.md for details on testing patterns if needed.
+**Note**: No lint/test/typecheck scripts configured. Frontend uses JavaScript (not TypeScript). Rust side has no `#[test]` cases.
 
 ## Architecture
 
@@ -35,9 +35,13 @@ npm run tauri build
 
 ### Backend (Rust + Tauri 2)
 - Entry: `src-tauri/src/main.rs`
-- Core logic: `src-tauri/src/lib.rs` (contains all Tauri commands)
-- WebSocket server: `src-tauri/src/ws_server.rs`
-- WebSocket client: `src-tauri/src/ws_client.rs`
+- Core logic: `src-tauri/src/lib.rs` (Tauri commands, clipboard monitoring, storage)
+- WebSocket server: `src-tauri/src/ws_server.rs` (host mode, broadcasts to clients)
+- WebSocket client: `src-tauri/src/ws_client.rs` (join mode, receives from host)
+
+### Key Configuration Files
+- `src-tauri/tauri.conf.json` - App ID, window config, permissions, build settings
+- `src-tauri/Cargo.toml` - Rust dependencies (arboard, tokio, image, sha2, etc.)
 
 ### Key Dependencies
 - `arboard` - Clipboard access
@@ -51,10 +55,11 @@ Default location: Tauri `app_data_dir` (configurable)
 - `settings.json` - User settings
 - `clipboard-images/` - Saved images
 
-### Window Configuration
-- Frameless window with custom title bar
-- Default size: 450x500
-- Hidden by default, toggled via global shortcut or tray
+### Window & System Integration
+- Frameless window with custom title bar (drag region)
+- System tray with menu (show/hide, quit)
+- Global shortcut to toggle window visibility
+- Default size: 450x500, hidden by default
 
 ## Development Notes
 

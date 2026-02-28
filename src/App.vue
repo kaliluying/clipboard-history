@@ -24,6 +24,11 @@ const launchAtStartup = ref(false);
 const alwaysOnTop = ref(false);
 const storageDir = ref("");
 const deviceName = ref("");
+const historyLimit = ref(300);
+const textRetentionDays = ref(30);
+const imageRetentionDays = ref(7);
+const maxStorageMb = ref(500);
+const storageStats = ref({ historyCount: 0, textCount: 0, imageCount: 0, favoriteCount: 0, imageStorageBytes: 0 });
 const imagePreviewMap = ref({});
 const previewLoadingMap = ref({});
 const expandedTextItem = ref(null);
@@ -245,6 +250,14 @@ function formatTime(ms) {
   return new Date(ms).toLocaleString();
 }
 
+function formatBytes(bytes) {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
 function shortText(text) {
   const source = (text || "").replace(/\s+/g, " ").trim();
   if (source.length <= 120) return source;
@@ -327,6 +340,25 @@ async function loadSettings() {
   }
   if (settings && typeof settings.deviceName === "string") {
     deviceName.value = settings.deviceName;
+  }
+  if (settings && typeof settings.historyLimit === "number") {
+    historyLimit.value = settings.historyLimit;
+  }
+  if (settings && typeof settings.textRetentionDays === "number") {
+    textRetentionDays.value = settings.textRetentionDays;
+  }
+  if (settings && typeof settings.imageRetentionDays === "number") {
+    imageRetentionDays.value = settings.imageRetentionDays;
+  }
+  if (settings && typeof settings.maxStorageMb === "number") {
+    maxStorageMb.value = settings.maxStorageMb;
+  }
+
+  // Load storage stats
+  try {
+    storageStats.value = await invoke("get_storage_stats");
+  } catch (e) {
+    console.error("load storage stats failed", e);
   }
 }
 
@@ -585,6 +617,10 @@ async function saveSettings() {
         alwaysOnTop: alwaysOnTop.value,
         storageDir: storageDir.value.trim(),
         deviceName: deviceName.value.trim(),
+        historyLimit: Number(historyLimit.value),
+        textRetentionDays: Number(textRetentionDays.value),
+        imageRetentionDays: Number(imageRetentionDays.value),
+        maxStorageMb: Number(maxStorageMb.value),
       },
     });
 
@@ -595,6 +631,10 @@ async function saveSettings() {
     alwaysOnTop.value = settings.alwaysOnTop;
     storageDir.value = settings.storageDir || "";
     deviceName.value = settings.deviceName || "";
+    historyLimit.value = settings.historyLimit || 300;
+    textRetentionDays.value = settings.textRetentionDays || 0;
+    imageRetentionDays.value = settings.imageRetentionDays || 0;
+    maxStorageMb.value = settings.maxStorageMb || 0;
 
     if (timer !== null) {
       window.clearInterval(timer);
@@ -607,6 +647,13 @@ async function saveSettings() {
       notice.value = `已保存快捷键：${settings.globalShortcut}`;
     } else {
       notice.value = "";
+    }
+
+    // Reload storage stats after save
+    try {
+      storageStats.value = await invoke("get_storage_stats");
+    } catch (e) {
+      console.error("reload storage stats failed", e);
     }
   } catch (error) {
     console.error("save settings failed", error);
@@ -686,6 +733,7 @@ watch(
   { immediate: true }
 );
 
+// 自动保存（不触发清理）
 watch([pollIntervalMs, shortcutDraft, launchAtStartup, alwaysOnTop, storageDir, deviceName], () => {
   scheduleAutoSaveSettings();
 });
@@ -778,6 +826,46 @@ onUnmounted(() => {
           <div class="setting-row setting-inline">
             <label>轮询间隔(ms)</label>
             <input v-model.number="pollIntervalMs" class="search compact-input" type="number" min="300" max="5000" />
+          </div>
+
+          <!-- 历史记录限制 -->
+          <div class="setting-section">
+            <h3 class="setting-section-title">📊 历史记录限制</h3>
+
+            <div class="storage-stats-row">
+              <span class="storage-stat">总计: {{ storageStats.historyCount || 0 }}</span>
+              <span class="storage-stat">文本: {{ storageStats.textCount || 0 }}</span>
+              <span class="storage-stat">图片: {{ storageStats.imageCount || 0 }}</span>
+              <span class="storage-stat">收藏: {{ storageStats.favoriteCount || 0 }}</span>
+              <span class="storage-stat">图片占用: {{ formatBytes(storageStats.imageStorageBytes || 0) }}</span>
+            </div>
+
+            <div class="setting-row setting-inline">
+              <label>历史记录数量</label>
+              <input v-model.number="historyLimit" class="search compact-input" type="number" min="50" max="5000" style="width:80px" />
+            </div>
+
+            <div class="setting-row setting-inline">
+              <label>文本保留天数</label>
+              <input v-model.number="textRetentionDays" class="search compact-input" type="number" min="0" max="365" style="width:80px" />
+              <span class="setting-hint">0=不限制</span>
+            </div>
+
+            <div class="setting-row setting-inline">
+              <label>图片保留天数</label>
+              <input v-model.number="imageRetentionDays" class="search compact-input" type="number" min="0" max="365" style="width:80px" />
+              <span class="setting-hint">0=不限制</span>
+            </div>
+
+            <div class="setting-row setting-inline">
+              <label>存储空间上限(MB)</label>
+              <input v-model.number="maxStorageMb" class="search compact-input" type="number" min="0" max="10000" style="width:80px" />
+              <span class="setting-hint">0=不限制</span>
+            </div>
+
+            <div class="setting-actions">
+              <button class="chip" @click="saveSettings">保存并清理</button>
+            </div>
           </div>
 
           <div class="setting-pair">
@@ -1611,6 +1699,28 @@ time {
   color: var(--text-soft);
   margin: 0 0 8px;
   letter-spacing: 0.03em;
+}
+
+.storage-stats-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-soft);
+  margin-bottom: 12px;
+  padding: 8px;
+  background: var(--bg-elevated);
+  border-radius: 6px;
+}
+
+.storage-stat {
+  white-space: nowrap;
+}
+
+.setting-hint {
+  font-size: 11px;
+  color: var(--text-soft);
+  margin-left: 6px;
 }
 
 .ws-mode-btns {
