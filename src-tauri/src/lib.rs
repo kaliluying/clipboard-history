@@ -576,19 +576,16 @@ fn clean_history(items: Vec<ClipboardItem>, settings: &AppSettings) -> Vec<Clipb
     }
 
     // Step 2: Time-based cleanup (preserve favorites always)
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = now_ms();
 
     let text_cutoff = if settings.text_retention_days > 0 {
-        now - (settings.text_retention_days as u64 * 86400)
+        now.saturating_sub(settings.text_retention_days as u64 * 86_400_000)
     } else {
         0
     };
 
     let image_cutoff = if settings.image_retention_days > 0 {
-        now - (settings.image_retention_days as u64 * 86400)
+        now.saturating_sub(settings.image_retention_days as u64 * 86_400_000)
     } else {
         0
     };
@@ -624,15 +621,72 @@ fn clean_history(items: Vec<ClipboardItem>, settings: &AppSettings) -> Vec<Clipb
     result
 }
 
+fn estimate_history_storage_bytes(app: &AppHandle, items: &[ClipboardItem]) -> Result<u64, String> {
+    let to_store: Vec<ClipboardItem> = items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            item.image_preview_data_url = None;
+            item
+        })
+        .collect();
+
+    let history_bytes = serde_json::to_vec(&to_store)
+        .map_err(|e| format!("估算历史存储大小失败: {e}"))?
+        .len() as u64;
+
+    let base_dir = data_dir(app)?;
+    let mut image_bytes = 0_u64;
+    for item in &to_store {
+        if let Some(rel) = item.image_path.as_deref() {
+            let path = base_dir.join(rel);
+            if let Ok(meta) = fs::metadata(path) {
+                image_bytes = image_bytes.saturating_add(meta.len());
+            }
+        }
+    }
+
+    Ok(history_bytes.saturating_add(image_bytes))
+}
+
+fn apply_storage_limit(
+    app: &AppHandle,
+    items: Vec<ClipboardItem>,
+    settings: &AppSettings,
+) -> Result<Vec<ClipboardItem>, String> {
+    if settings.max_storage_mb == 0 {
+        return Ok(items);
+    }
+
+    let limit_bytes = u64::from(settings.max_storage_mb).saturating_mul(1024 * 1024);
+    let mut trimmed = items;
+
+    while estimate_history_storage_bytes(app, &trimmed)? > limit_bytes {
+        let Some(remove_idx) = trimmed.iter().rposition(|item| !item.is_favorite) else {
+            break;
+        };
+        trimmed.remove(remove_idx);
+    }
+
+    Ok(trimmed)
+}
+
+fn prepare_history_items(
+    app: &AppHandle,
+    items: Vec<ClipboardItem>,
+    settings: &AppSettings,
+) -> Result<Vec<ClipboardItem>, String> {
+    let cleaned = clean_history(items, settings);
+    apply_storage_limit(app, cleaned, settings)
+}
+
 fn load_history_clean(app: &AppHandle) -> Result<Vec<ClipboardItem>, String> {
     let settings = load_settings(app)?;
     let items = load_history(app)?;
-    let mut cleaned = clean_history(items, &settings);
+    let mut cleaned = prepare_history_items(app, items, &settings)?;
     for item in &mut cleaned {
         item.image_preview_data_url = None;
     }
-    // Clean up orphaned images
-    let _ = cleanup_orphaned_images(app, &cleaned);
     Ok(cleaned)
 }
 
@@ -669,6 +723,13 @@ fn save_history(app: &AppHandle, items: &[ClipboardItem]) -> Result<(), String> 
     let json =
         serde_json::to_string_pretty(&to_store).map_err(|e| format!("序列化历史失败: {e}"))?;
     fs::write(path, json).map_err(|e| format!("写入历史失败: {e}"))
+}
+
+fn find_history_item_by_id(app: &AppHandle, id: &str) -> Result<ClipboardItem, String> {
+    load_history(app)?
+        .into_iter()
+        .find(|it| it.id == id)
+        .ok_or_else(|| "未找到历史项".to_string())
 }
 
 fn encode_rgba_to_png_bytes(image: &ImageData<'_>) -> Result<Vec<u8>, String> {
@@ -1211,16 +1272,16 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
     }
     next = normalize_settings(next);
 
+    let new_dir = data_dir_from_settings(&app, &next)?;
+    migrate_storage_if_needed(&old_dir, &new_dir)?;
+
     save_settings(&app, &next)?;
 
     // Apply cleanup after settings changed
     let mut items = load_history(&app)?;
-    items = clean_history(items, &next);
+    items = prepare_history_items(&app, items, &next)?;
     save_history(&app, &items)?;
     cleanup_orphaned_images(&app, &items)?;
-
-    let new_dir = data_dir_from_settings(&app, &next)?;
-    migrate_storage_if_needed(&old_dir, &new_dir)?;
 
     register_global_shortcut(&app, &next.global_shortcut)?;
     if let Err(err) = set_autostart_enabled(&app, next.launch_at_startup) {
@@ -1250,10 +1311,7 @@ fn get_history(app: AppHandle) -> Result<Vec<ClipboardItem>, String> {
 #[tauri::command]
 fn get_image_preview(id: String, app: AppHandle) -> Result<Option<String>, String> {
     ensure_storage_layout(&app)?;
-    let item = load_history_clean(&app)?
-        .into_iter()
-        .find(|it| it.id == id)
-        .ok_or_else(|| "未找到历史项".to_string())?;
+    let item = find_history_item_by_id(&app, &id)?;
     build_image_preview_data_url(&app, &item)
 }
 
@@ -1429,7 +1487,9 @@ fn poll_clipboard(app: AppHandle, state: State<AppState>) -> Result<Option<Clipb
     let settings = load_settings(&app)?;
     let mut items = load_history(&app)?;
     dedupe_and_upsert(&mut items, item, &settings);
+    items = prepare_history_items(&app, items, &settings)?;
     save_history(&app, &items)?;
+    cleanup_orphaned_images(&app, &items)?;
     let item_type = &items[0].item_type;
     if capture_debug.is_empty() {
         append_log(
@@ -1577,14 +1637,17 @@ fn toggle_favorite(id: String, app: AppHandle) -> Result<Option<ClipboardItem>, 
         }
     }
 
-    if let Some(ref changed) = updated {
-        items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        if let Some(idx) = items.iter().position(|it| it.id == changed.id) {
-            let item = items.remove(idx);
-            items.insert(0, item);
+        if let Some(ref changed) = updated {
+            items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            if let Some(idx) = items.iter().position(|it| it.id == changed.id) {
+                let item = items.remove(idx);
+                items.insert(0, item);
+            }
+            let settings = load_settings(&app)?;
+            items = prepare_history_items(&app, items, &settings)?;
+            save_history(&app, &items)?;
+            cleanup_orphaned_images(&app, &items)?;
         }
-        save_history(&app, &items)?;
-    }
 
     Ok(updated)
 }
@@ -1900,6 +1963,7 @@ fn get_local_ip_list() -> Vec<String> {
     ips
 }
 
+#[cfg(target_os = "windows")]
 fn extract_ip_from_line(line: &str) -> Option<std::net::Ipv4Addr> {
     // 格式: "IPv4 地址 . . . . . . . . . . . : 192.168.1.100"
     // 或: "IPv4 Address. . . . . . . . . . . . : 192.168.1.100"
@@ -1968,7 +2032,16 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
         if let Ok(settings) = load_settings(app) {
             if let Ok(mut items) = load_history(app) {
                 dedupe_and_upsert(&mut items, item, &settings);
+                let fallback_items = items.clone();
+                let items = match prepare_history_items(app, items, &settings) {
+                    Ok(items) => items,
+                    Err(err) => {
+                        append_log(app, "WARN", &format!("prepare synced text history failed: {err}"));
+                        fallback_items
+                    }
+                };
                 let _ = save_history(app, &items);
+                let _ = cleanup_orphaned_images(app, &items);
             }
         }
 
@@ -2019,7 +2092,16 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
                 if let Ok(settings) = load_settings(app) {
                     if let Ok(mut items) = load_history(app) {
                         dedupe_and_upsert(&mut items, item, &settings);
+                        let fallback_items = items.clone();
+                        let items = match prepare_history_items(app, items, &settings) {
+                            Ok(items) => items,
+                            Err(err) => {
+                                append_log(app, "WARN", &format!("prepare synced image history failed: {err}"));
+                                fallback_items
+                            }
+                        };
                         let _ = save_history(app, &items);
+                        let _ = cleanup_orphaned_images(app, &items);
                     }
                 }
 
@@ -2074,6 +2156,9 @@ pub fn run() {
             }
             ensure_storage_layout(&app.handle())?;
             let settings = load_settings(&app.handle())?;
+            let items = prepare_history_items(&app.handle(), load_history(&app.handle())?, &settings)?;
+            save_history(&app.handle(), &items)?;
+            cleanup_orphaned_images(&app.handle(), &items)?;
             if let Err(err) = register_global_shortcut(&app.handle(), &settings.global_shortcut) {
                 eprintln!("global shortcut setup failed: {err}");
                 let fallback = "Alt+Shift+V";

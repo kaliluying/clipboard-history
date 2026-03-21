@@ -184,7 +184,7 @@ async function wsReconnect() {
   try {
     const status = await invoke("ws_connect_client", { url: wsUrl.value.trim() });
     wsRunning.value = status.running;
-    notice.value = `正在重连...`;
+    notice.value = `已重新连接到：${wsUrl.value}`;
   } catch (e) {
     notice.value = `重连失败：${e}`;
   } finally {
@@ -778,9 +778,6 @@ onUnmounted(() => {
   }
   if (saveSettingsTimer !== null) {
     window.clearTimeout(saveSettingsTimer);
-  }
-  if (copyNoticeTimer !== null) {
-    window.clearTimeout(copyNoticeTimer);
   }
   if (copiedItemTimer !== null) {
     window.clearTimeout(copiedItemTimer);

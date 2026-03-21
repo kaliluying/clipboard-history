@@ -8,7 +8,8 @@ use tokio_tungstenite::tungstenite::Message;
 pub struct WsClient {
     shutdown_tx: Option<mpsc::Sender<()>>,
     send_tx: Option<mpsc::UnboundedSender<String>>,
-    connected_url: tokio::sync::Mutex<Option<String>>,
+    connected_url: Arc<tokio::sync::Mutex<Option<String>>>,
+    connected: Arc<AtomicBool>,
     /// 是否启用自动重连（使用 Arc 以便在任务间共享）
     auto_reconnect: Arc<AtomicBool>,
 }
@@ -18,7 +19,8 @@ impl WsClient {
         Self {
             shutdown_tx: None,
             send_tx: None,
-            connected_url: tokio::sync::Mutex::new(None),
+            connected_url: Arc::new(tokio::sync::Mutex::new(None)),
+            connected: Arc::new(AtomicBool::new(false)),
             auto_reconnect: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -31,6 +33,9 @@ impl WsClient {
         url: &str,
         app_tx: mpsc::UnboundedSender<String>,
     ) -> Result<(), String> {
+        let should_emit_reconnected =
+            self.shutdown_tx.is_some() || self.connected.load(Ordering::SeqCst);
+
         // 如果已有连接，先断开清理
         if self.shutdown_tx.is_some() {
             self.disconnect().await;
@@ -49,11 +54,15 @@ impl WsClient {
 
         self.shutdown_tx = Some(shutdown_tx);
         self.send_tx = Some(send_tx);
+        self.connected.store(true, Ordering::SeqCst);
         *self.connected_url.lock().await = Some(url.to_string());
 
         // 克隆 Arc 供任务使用
         let auto_reconnect = Arc::clone(&self.auto_reconnect);
+        let connected = Arc::clone(&self.connected);
+        let connected_url = Arc::clone(&self.connected_url);
         let app_tx_clone = app_tx.clone();
+        let app_tx_incoming = app_tx.clone();
 
         // Task: send outgoing messages to WebSocket
         tokio::spawn(async move {
@@ -71,7 +80,7 @@ impl WsClient {
                     msg = ws_source.next() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
-                                let _ = app_tx.send(text.to_string());
+                                let _ = app_tx_incoming.send(text.to_string());
                             }
                             Some(Ok(Message::Close(_))) | None => break,
                             Some(Err(e)) => {
@@ -84,6 +93,9 @@ impl WsClient {
                     _ = shutdown_rx.recv() => break,
                 }
             }
+            connected.store(false, Ordering::SeqCst);
+            *connected_url.lock().await = None;
+
             // 通知连接断开
             let _ = app_tx_clone.send("__disconnected__".to_string());
 
@@ -93,6 +105,10 @@ impl WsClient {
             }
         });
 
+        if should_emit_reconnected {
+            let _ = app_tx.send("__reconnected__".to_string());
+        }
+
         Ok(())
     }
 
@@ -100,6 +116,7 @@ impl WsClient {
     pub async fn disconnect(&mut self) {
         // 禁用自动重连
         self.auto_reconnect.store(false, Ordering::SeqCst);
+        self.connected.store(false, Ordering::SeqCst);
 
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
@@ -110,6 +127,10 @@ impl WsClient {
 
     /// 发送消息到 Server（Server 会转发给其他所有 client）
     pub fn send_text(&self, json: String) -> Result<(), String> {
+        if !self.connected.load(Ordering::SeqCst) {
+            return Err("未连接".to_string());
+        }
+
         match &self.send_tx {
             Some(tx) => tx.send(json).map_err(|e| format!("发送失败: {e}")),
             None => Err("未连接".to_string()),
@@ -117,7 +138,7 @@ impl WsClient {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.shutdown_tx.is_some()
+        self.connected.load(Ordering::SeqCst)
     }
 
     /// 获取当前连接的 URL
