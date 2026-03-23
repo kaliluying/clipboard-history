@@ -127,6 +127,10 @@ struct AppState {
     ws_client: TokioMutex<ws_client::WsClient>,
     /// 本设备唯一 ID，用于过滤自己发出的消息回环
     device_id: String,
+    /// 设置内存缓存（避免热路径每次读磁盘）
+    cached_settings: Mutex<Option<AppSettings>>,
+    /// 历史记录内存缓存
+    cached_history: Mutex<Option<Vec<ClipboardItem>>>,
 }
 
 impl Default for AppState {
@@ -139,6 +143,8 @@ impl Default for AppState {
             ws_server: TokioMutex::new(ws_server::WsServer::new()),
             ws_client: TokioMutex::new(ws_client::WsClient::new()),
             device_id: Uuid::new_v4().to_string(),
+            cached_settings: Mutex::new(None),
+            cached_history: Mutex::new(None),
         }
     }
 }
@@ -445,22 +451,58 @@ fn append_diagnostic_log_throttled(app: &AppHandle, state: &State<AppState>, mes
     append_log(app, "DEBUG", message);
 }
 
-fn load_settings(app: &AppHandle) -> Result<AppSettings, String> {
+/// 从磁盘加载设置（内部使用，不写缓存）
+fn load_settings_from_disk(app: &AppHandle) -> Result<AppSettings, String> {
     let path = settings_file(app)?;
     if !path.exists() {
         return Ok(AppSettings::default());
     }
-
     let raw = fs::read_to_string(path).map_err(|e| format!("读取设置失败: {e}"))?;
     let parsed = serde_json::from_str::<AppSettings>(&raw).unwrap_or_default();
     Ok(normalize_settings(parsed))
 }
 
+/// 带缓存的设置读取（热路径主入口）
+fn load_settings(app: &AppHandle) -> Result<AppSettings, String> {
+    let state = app.state::<AppState>();
+    {
+        if let Ok(lock) = state.cached_settings.lock() {
+            if let Some(ref s) = *lock {
+                return Ok(s.clone());
+            }
+        }
+    }
+    let settings = load_settings_from_disk(app)?;
+    if let Ok(mut lock) = state.cached_settings.lock() {
+        *lock = Some(settings.clone());
+    }
+    Ok(settings)
+}
+
+/// 写入设置并更新缓存
 fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = settings_file(app)?;
     let json =
         serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {e}"))?;
-    fs::write(path, json).map_err(|e| format!("写入设置失败: {e}"))
+    fs::write(path, json).map_err(|e| format!("写入设置失败: {e}"))?;
+    // 写通缓存
+    let state = app.state::<AppState>();
+    if let Ok(mut lock) = state.cached_settings.lock() {
+        *lock = Some(settings.clone());
+    }
+    Ok(())
+}
+
+/// 设置变更后清除完整缓存（存储目录切换时调用）
+fn invalidate_cache(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Ok(mut lock) = state.cached_settings.lock() {
+        *lock = None;
+    }
+    if let Ok(mut lock) = state.cached_history.lock() {
+        *lock = None;
+    }
+    drop(state);
 }
 
 fn data_dir_from_settings(app: &AppHandle, settings: &AppSettings) -> Result<PathBuf, String> {
@@ -533,15 +575,25 @@ fn migrate_storage_if_needed(old_dir: &Path, new_dir: &Path) -> Result<(), Strin
 }
 
 fn load_history(app: &AppHandle) -> Result<Vec<ClipboardItem>, String> {
+    let state = app.state::<AppState>();
+    {
+        if let Ok(lock) = state.cached_history.lock() {
+            if let Some(ref h) = *lock {
+                return Ok(h.clone());
+            }
+        }
+    }
     let path = history_file(app)?;
     if !path.exists() {
         return Ok(Vec::new());
     }
-
     let raw = fs::read_to_string(&path).map_err(|e| format!("读取历史失败: {e}"))?;
     let mut items: Vec<ClipboardItem> =
         serde_json::from_str(&raw).map_err(|e| format!("解析历史失败: {e}"))?;
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    if let Ok(mut lock) = state.cached_history.lock() {
+        *lock = Some(items.clone());
+    }
     Ok(items)
 }
 
@@ -704,9 +756,11 @@ fn build_image_preview_data_url(
 
     let path = data_dir(app)?.join(rel);
     let bytes = fs::read(path).map_err(|e| format!("读取图片预览失败: {e}"))?;
+    // 生成缩略图（最大 600px），避免原始大图通过 IPC 传输
+    let thumb_bytes = build_thumbnail_png_bytes(&bytes, 600).unwrap_or(bytes);
     Ok(Some(format!(
         "data:image/png;base64,{}",
-        BASE64.encode(bytes)
+        BASE64.encode(thumb_bytes)
     )))
 }
 
@@ -722,7 +776,13 @@ fn save_history(app: &AppHandle, items: &[ClipboardItem]) -> Result<(), String> 
         .collect();
     let json =
         serde_json::to_string_pretty(&to_store).map_err(|e| format!("序列化历史失败: {e}"))?;
-    fs::write(path, json).map_err(|e| format!("写入历史失败: {e}"))
+    fs::write(path, json).map_err(|e| format!("写入历史失败: {e}"))?;
+    // 写通缓存（存兑不含预览）
+    let state = app.state::<AppState>();
+    if let Ok(mut lock) = state.cached_history.lock() {
+        *lock = Some(to_store);
+    }
+    Ok(())
 }
 
 fn find_history_item_by_id(app: &AppHandle, id: &str) -> Result<ClipboardItem, String> {
@@ -764,6 +824,14 @@ fn encode_dynamic_to_png_bytes(image: DynamicImage) -> Result<Vec<u8>, String> {
     Ok(cursor.into_inner())
 }
 
+/// 将 PNG 字节缩略为最大 `max_px` * `max_px` 并重新编码，用于预览传输
+fn build_thumbnail_png_bytes(png_bytes: &[u8], max_px: u32) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory(png_bytes)
+        .map_err(|e| format!("加载图片用于缩略失败: {e}"))?;
+    let thumb = img.thumbnail(max_px, max_px);
+    encode_dynamic_to_png_bytes(thumb)
+}
+
 fn image_item_from_png_bytes(app: &AppHandle, png_bytes: Vec<u8>) -> Result<ClipboardItem, String> {
     let content_hash = hash_bytes(&png_bytes);
     let now = now_ms();
@@ -776,10 +844,9 @@ fn image_item_from_png_bytes(app: &AppHandle, png_bytes: Vec<u8>) -> Result<Clip
     }
 
     let preview = if is_new_file {
-        Some(format!(
-            "data:image/png;base64,{}",
-            BASE64.encode(&png_bytes)
-        ))
+        // 生成缩略图预览，保留原图文件不变
+        let thumb = build_thumbnail_png_bytes(&png_bytes, 600).unwrap_or_else(|_| png_bytes.clone());
+        Some(format!("data:image/png;base64,{}", BASE64.encode(&thumb)))
     } else {
         None
     };
@@ -1275,6 +1342,10 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
     let new_dir = data_dir_from_settings(&app, &next)?;
     migrate_storage_if_needed(&old_dir, &new_dir)?;
 
+    // 存储目录可能变化，先清缓存再写设置，确保后续读取路径正确
+    if old_dir != new_dir {
+        invalidate_cache(&app);
+    }
     save_settings(&app, &next)?;
 
     // Apply cleanup after settings changed

@@ -4,6 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import HistoryList from "./components/HistoryList.vue";
+import SettingsPanel from "./components/SettingsPanel.vue";
+import TextPreviewModal from "./components/TextPreviewModal.vue";
 
 const DEFAULT_POLL_INTERVAL_MS = 800;
 
@@ -272,28 +275,8 @@ function updateStorageStats() {
   };
 }
 
-function formatTime(ms) {
-  return new Date(ms).toLocaleString();
-}
 
-function formatBytes(bytes) {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
-}
 
-function shortText(text) {
-  const source = (text || "").replace(/\s+/g, " ").trim();
-  if (source.length <= 120) return source;
-  return `${source.slice(0, 120)}...`;
-}
-
-function isTextTruncated(text) {
-  const source = (text || "").replace(/\s+/g, " ").trim();
-  return source.length > 120;
-}
 
 function keyToAccelerator(event) {
   const parts = [];
@@ -834,265 +817,74 @@ onUnmounted(() => {
       </template>
 
       <template v-else>
-        <div class="settings-compact">
-          <div class="setting-actions top-setting-actions">
-            <button class="chip" @click="page = 'history'">返回历史</button>
-          </div>
-
-          <div class="setting-row setting-inline">
-            <label>全局快捷键</label>
-            <div class="setting-actions">
-              <input
-                class="search compact-input"
-                :value="shortcutDraft"
-                readonly
-                @keydown="onShortcutKeydown"
-                @click="startRecordShortcut"
-                @blur="onShortcutInputBlur"
-                placeholder="点击输入框后按下组合键"
-              />
-            </div>
-          </div>
-
-          <div class="setting-row setting-inline">
-            <label>轮询间隔(ms)</label>
-            <input v-model.number="pollIntervalMs" class="search compact-input" type="number" min="300" max="5000" />
-          </div>
-
-          <!-- 历史记录限制 -->
-          <div class="setting-section">
-            <h3 class="setting-section-title">📊 历史记录限制</h3>
-
-            <div class="storage-stats-row">
-              <span class="storage-stat">总计: {{ storageStats.historyCount || 0 }}</span>
-              <span class="storage-stat">文本: {{ storageStats.textCount || 0 }}</span>
-              <span class="storage-stat">图片: {{ storageStats.imageCount || 0 }}</span>
-              <span class="storage-stat">收藏: {{ storageStats.favoriteCount || 0 }}</span>
-              <span class="storage-stat">图片占用: {{ formatBytes(storageStats.imageStorageBytes || 0) }}</span>
-            </div>
-
-            <div class="setting-row setting-inline">
-              <label>历史记录数量</label>
-              <input v-model.number="historyLimit" class="search compact-input" type="number" min="50" max="5000" style="width:80px" />
-            </div>
-
-            <div class="setting-row setting-inline">
-              <label>文本保留天数</label>
-              <input v-model.number="textRetentionDays" class="search compact-input" type="number" min="0" max="365" style="width:80px" />
-              <span class="setting-hint">0=不限制</span>
-            </div>
-
-            <div class="setting-row setting-inline">
-              <label>图片保留天数</label>
-              <input v-model.number="imageRetentionDays" class="search compact-input" type="number" min="0" max="365" style="width:80px" />
-              <span class="setting-hint">0=不限制</span>
-            </div>
-
-            <div class="setting-row setting-inline">
-              <label>存储空间上限(MB)</label>
-              <input v-model.number="maxStorageMb" class="search compact-input" type="number" min="0" max="10000" style="width:80px" />
-              <span class="setting-hint">0=不限制</span>
-            </div>
-
-            <div class="setting-actions">
-              <button class="chip" @click="saveSettings">保存并清理</button>
-            </div>
-          </div>
-
-          <div class="setting-pair">
-            <div class="setting-row setting-inline">
-              <label>开机自启</label>
-              <label class="switch-row">
-                <input v-model="launchAtStartup" type="checkbox" />
-                <span>{{ launchAtStartup ? "已启用" : "未启用" }}</span>
-              </label>
-            </div>
-
-            <div class="setting-row setting-inline">
-              <label>窗口置顶</label>
-              <label class="switch-row">
-                <input v-model="alwaysOnTop" type="checkbox" />
-                <span>{{ alwaysOnTop ? "已启用" : "未启用" }}</span>
-              </label>
-            </div>
-          </div>
-
-          <div class="setting-row">
-            <label>存储目录</label>
-            <div class="storage-dir-row">
-              <div class="storage-dir-display" :title="storageDir || '默认应用数据目录'">
-                <input
-                  class="search compact-input storage-dir-input"
-                  :value="storageDir || '默认应用数据目录'"
-                  readonly
-                  @click="selectStorageDir"
-                  title="点击选择保存位置"
-                />
-              </div>
-              <div class="setting-actions storage-dir-actions">
-                <button class="chip" @click="openStorageDir">打开目录</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="setting-row setting-inline">
-            <label>设备名称</label>
-            <input
-              v-model="deviceName"
-              class="search compact-input"
-              placeholder="用于局域网识别"
-              style="min-width:120px"
-            />
-          </div>
-
-          <div class="setting-actions bottom-setting-actions">
-            <button class="chip danger" :class="{ 'danger-confirm': isClearHistoryConfirming }" @click="clearAllHistory">
-              {{ isClearHistoryConfirming ? "再次点击确认删除" : "删除全部历史" }}
-            </button>
-          </div>
-
-          <!-- 局域网剪切板共享 -->
-          <div class="setting-section">
-            <h3 class="setting-section-title">📶 局域网共享</h3>
-
-            <div class="setting-row setting-inline">
-              <label>模式</label>
-              <div class="ws-mode-btns">
-                <button :class="['chip', { active: wsMode === 'disabled' }]" @click="wsMode = 'disabled'">禁用</button>
-                <button :class="['chip', { active: wsMode === 'server' }]" @click="wsMode = 'server'">作为主机</button>
-                <button :class="['chip', { active: wsMode === 'client' }]" @click="wsMode = 'client'">加入主机</button>
-              </div>
-            </div>
-
-            <template v-if="wsMode === 'server'">
-              <div class="setting-row setting-inline">
-                <label>端口</label>
-                <input v-model.number="wsPort" class="search compact-input" type="number" min="1024" max="65535" style="width:90px" />
-              </div>
-              <div v-if="wsLocalIps.length > 1" class="setting-row setting-inline">
-                <label>绑定IP</label>
-                <select v-model="wsSelectedIp" class="search compact-input" style="min-width:150px">
-                  <option v-for="ip in wsLocalIps" :key="ip" :value="ip">{{ ip }}</option>
-                </select>
-              </div>
-              <div v-else-if="wsLocalIps.length === 1" class="setting-row setting-inline">
-                <label>绑定IP</label>
-                <code class="ws-addr" style="margin-left:4px">{{ wsLocalIps[0] }}</code>
-              </div>
-              <div class="setting-row">
-                <div class="setting-actions">
-                  <button v-if="!wsRunning" class="chip" :disabled="wsLoading" @click="wsStartServer">
-                    {{ wsLoading ? '启动中...' : '启动' }}
-                  </button>
-                  <button v-else class="chip danger" :disabled="wsLoading" @click="wsStopServer">
-                    {{ wsLoading ? '停止中...' : '停止服务' }}
-                  </button>
-                </div>
-              </div>
-              <div v-if="wsRunning && wsAddress" class="ws-address-box">
-                <span class="ws-label">其它设备输入：</span>
-                <code class="ws-addr">{{ wsAddress }}</code>
-              </div>
-            </template>
-
-            <template v-if="wsMode === 'client'">
-              <div class="setting-row setting-inline">
-                <label>服务器地址</label>
-                <input
-                  v-model="wsUrl"
-                  class="search compact-input"
-                  placeholder="ws://192.168.1.x:9521"
-                  style="min-width:180px"
-                />
-              </div>
-              <div v-if="wsLocalIps.length" class="ws-ips">
-                <span class="ws-label">本机 IP：</span>
-                <code v-for="ip in wsLocalIps" :key="ip" class="ws-addr" style="margin-right:6px">{{ ip }}</code>
-              </div>
-              <div class="setting-row">
-                <div class="setting-actions">
-                  <button v-if="!wsRunning" class="chip" :disabled="wsLoading" @click="wsConnectClient">
-                    {{ wsLoading ? '连接中...' : '连接' }}
-                  </button>
-                  <button v-else class="chip danger" :disabled="wsLoading" @click="wsDisconnectClient">
-                    {{ wsLoading ? '断开中...' : '断开' }}
-                  </button>
-                </div>
-              </div>
-              <div class="ws-status-row">
-                <span class="ws-dot" :class="{ connected: wsRunning }"></span>
-                <span>{{ wsRunning ? '已连接' : '未连接' }}</span>
-              </div>
-            </template>
-          </div>
-        </div>
+        <SettingsPanel
+          :shortcutDraft="shortcutDraft"
+          :pollIntervalMs="pollIntervalMs"
+          :launchAtStartup="launchAtStartup"
+          :alwaysOnTop="alwaysOnTop"
+          :storageDir="storageDir"
+          :deviceName="deviceName"
+          :historyLimit="historyLimit"
+          :textRetentionDays="textRetentionDays"
+          :imageRetentionDays="imageRetentionDays"
+          :maxStorageMb="maxStorageMb"
+          :storageStats="storageStats"
+          :isClearHistoryConfirming="isClearHistoryConfirming"
+          :wsMode="wsMode"
+          :wsPort="wsPort"
+          :wsUrl="wsUrl"
+          :wsRunning="wsRunning"
+          :wsLoading="wsLoading"
+          :wsAddress="wsAddress"
+          :wsLocalIps="wsLocalIps"
+          :wsSelectedIp="wsSelectedIp"
+          @go-history="page = 'history'"
+          @update:pollIntervalMs="pollIntervalMs = $event"
+          @update:launchAtStartup="launchAtStartup = $event"
+          @update:alwaysOnTop="alwaysOnTop = $event"
+          @update:deviceName="deviceName = $event"
+          @update:historyLimit="historyLimit = $event"
+          @update:textRetentionDays="textRetentionDays = $event"
+          @update:imageRetentionDays="imageRetentionDays = $event"
+          @update:maxStorageMb="maxStorageMb = $event"
+          @shortcut-keydown="onShortcutKeydown"
+          @shortcut-click="startRecordShortcut"
+          @shortcut-blur="onShortcutInputBlur"
+          @save-settings="saveSettings"
+          @select-storage-dir="selectStorageDir"
+          @open-storage-dir="openStorageDir"
+          @clear-history="clearAllHistory"
+          @update:wsMode="wsMode = $event"
+          @update:wsPort="wsPort = $event"
+          @update:wsUrl="wsUrl = $event"
+          @update:wsSelectedIp="wsSelectedIp = $event"
+          @ws-start-server="wsStartServer"
+          @ws-stop-server="wsStopServer"
+          @ws-connect-client="wsConnectClient"
+          @ws-disconnect-client="wsDisconnectClient"
+        />
       </template>
 
       <p v-if="notice" class="notice">{{ notice }}</p>
     </section>
 
-    <section v-if="page === 'history'" class="history-list">
-      <article
-        v-for="item in visibleHistory"
-        :key="item.id"
-        :class="['panel', 'history-item', { copied: copiedItemId === item.id }]"
-        @click="copyItem(item, $event)"
-      >
-        <header>
-          <span class="tag" :class="item.type">{{ item.type === "text" ? "文本" : "图片" }}</span>
-          <time>{{ formatTime(item.updatedAt) }}</time>
-        </header>
+    <HistoryList
+      v-if="page === 'history'"
+      :items="visibleHistory"
+      :copiedItemId="copiedItemId"
+      :imagePreviewMap="imagePreviewMap"
+      @copy-item="copyItem"
+      @toggle-favorite="toggleFavorite"
+      @delete-item="deleteItem"
+      @open-text-preview="openTextPreview"
+    />
 
-        <template v-if="item.type === 'text'">
-          <p class="text-preview" :title="item.text || ''">{{ shortText(item.text) }}</p>
-        </template>
-
-        <div v-else class="image-preview-wrap">
-          <img
-            v-if="imagePreviewMap[item.id] || item.imagePreviewDataUrl"
-            :src="imagePreviewMap[item.id] || item.imagePreviewDataUrl"
-            alt="clipboard image"
-            class="image-preview"
-          />
-          <div v-else class="image-preview-placeholder">加载中...</div>
-        </div>
-
-        <div class="history-actions">
-          <button
-            v-if="item.type === 'text' && isTextTruncated(item.text)"
-            class="text-expand-btn"
-            @click.stop="openTextPreview(item)"
-          >
-            展开全文
-          </button>
-          <button
-            class="favorite-toggle"
-            :class="{ active: item.isFavorite }"
-            @click.stop="toggleFavorite(item)"
-          >
-            {{ item.isFavorite ? "已收藏" : "收藏" }}
-          </button>
-          <button class="history-delete-btn" @click.stop="deleteItem(item)">删除</button>
-        </div>
-      </article>
-
-      <article v-if="visibleHistory.length === 0" class="panel empty">
-        <p>当前没有可展示的历史项，复制任意文本或图片后会自动出现。</p>
-      </article>
-    </section>
-
-    <section v-if="expandedTextItem" class="text-modal-mask" @click="closeTextPreview">
-      <article class="panel text-modal" @mousedown.stop @click.stop>
-        <header class="text-modal-header">
-          <strong>全文预览</strong>
-          <button class="text-modal-close" @click="closeTextPreview">关闭</button>
-        </header>
-        <pre class="text-modal-content">{{ expandedTextItem.text || "" }}</pre>
-        <footer class="text-modal-footer">
-          <button class="chip" @click="copyExpandedText">复制全文</button>
-        </footer>
-      </article>
-    </section>
+    <TextPreviewModal
+      v-if="expandedTextItem"
+      :item="expandedTextItem"
+      @close="closeTextPreview"
+      @copy="copyExpandedText"
+    />
   </main>
 </template>
 
