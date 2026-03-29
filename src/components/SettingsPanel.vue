@@ -1,4 +1,6 @@
 <script setup>
+import { ref } from 'vue';
+
 defineProps({
   // 基本设置
   shortcutDraft: { type: String, required: true },
@@ -55,6 +57,8 @@ const emit = defineEmits([
   "ws-disconnect-client",
 ]);
 
+const activeTab = ref('general');
+
 function formatBytes(bytes) {
   if (bytes === 0) return "0 B";
   const k = 1024;
@@ -66,261 +70,272 @@ function formatBytes(bytes) {
 
 <template>
   <div class="settings-compact">
-    <div class="setting-actions top-setting-actions">
-      <button class="chip" @click="emit('go-history')">返回历史</button>
-    </div>
-
-    <div class="setting-row setting-inline">
-      <label>全局快捷键</label>
-      <div class="setting-actions">
-        <input
-          class="search compact-input"
-          :value="shortcutDraft"
-          readonly
-          @keydown="emit('shortcut-keydown', $event)"
-          @click="emit('shortcut-click')"
-          @blur="emit('shortcut-blur')"
-          placeholder="点击输入框后按下组合键"
-        />
+    <div class="setting-actions top-setting-actions" style="margin-bottom: 16px; display: flex; align-items: center;">
+      <button class="chip" @click="emit('go-history')">⟵ 返回</button>
+      <div class="tab-controls" style="display: flex; gap: 6px; margin-left: 12px; background: rgba(0,0,0,0.25); padding: 4px; border-radius: 8px;">
+        <button class="chip" :class="{ active: activeTab === 'general' }" @click="activeTab = 'general'">常规</button>
+        <button class="chip" :class="{ active: activeTab === 'storage' }" @click="activeTab = 'storage'">回收策略</button>
+        <button class="chip" :class="{ active: activeTab === 'network' }" @click="activeTab = 'network'">局域网共享</button>
       </div>
     </div>
 
-    <div class="setting-row setting-inline">
-      <label>轮询间隔(ms)</label>
-      <input
-        :value="pollIntervalMs"
-        class="search compact-input"
-        type="number"
-        min="300"
-        max="5000"
-        @input="emit('update:pollIntervalMs', Number($event.target.value))"
-      />
-    </div>
-
-    <!-- 历史记录限制 -->
-    <div class="setting-section">
-      <h3 class="setting-section-title">📊 历史记录限制</h3>
-
-      <div class="storage-stats-row">
-        <span class="storage-stat">总计: {{ storageStats.historyCount || 0 }}</span>
-        <span class="storage-stat">文本: {{ storageStats.textCount || 0 }}</span>
-        <span class="storage-stat">图片: {{ storageStats.imageCount || 0 }}</span>
-        <span class="storage-stat">收藏: {{ storageStats.favoriteCount || 0 }}</span>
-        <span class="storage-stat">图片占用: {{ formatBytes(storageStats.imageStorageBytes || 0) }}</span>
-      </div>
-
+    <!-- 常规设置 Tab -->
+    <div v-show="activeTab === 'general'" class="settings-tab-content">
       <div class="setting-row setting-inline">
-        <label>历史记录数量</label>
-        <input
-          :value="historyLimit"
-          class="search compact-input"
-          type="number"
-          min="50"
-          max="5000"
-          style="width:80px"
-          @input="emit('update:historyLimit', Number($event.target.value))"
-        />
-      </div>
-
-      <div class="setting-row setting-inline">
-        <label>文本保留天数</label>
-        <input
-          :value="textRetentionDays"
-          class="search compact-input"
-          type="number"
-          min="0"
-          max="365"
-          style="width:80px"
-          @input="emit('update:textRetentionDays', Number($event.target.value))"
-        />
-        <span class="setting-hint">0=不限制</span>
-      </div>
-
-      <div class="setting-row setting-inline">
-        <label>图片保留天数</label>
-        <input
-          :value="imageRetentionDays"
-          class="search compact-input"
-          type="number"
-          min="0"
-          max="365"
-          style="width:80px"
-          @input="emit('update:imageRetentionDays', Number($event.target.value))"
-        />
-        <span class="setting-hint">0=不限制</span>
-      </div>
-
-      <div class="setting-row setting-inline">
-        <label>存储空间上限(MB)</label>
-        <input
-          :value="maxStorageMb"
-          class="search compact-input"
-          type="number"
-          min="0"
-          max="10000"
-          style="width:80px"
-          @input="emit('update:maxStorageMb', Number($event.target.value))"
-        />
-        <span class="setting-hint">0=不限制</span>
-      </div>
-
-      <div class="setting-actions">
-        <button class="chip" @click="emit('save-settings')">保存并清理</button>
-      </div>
-    </div>
-
-    <div class="setting-pair">
-      <div class="setting-row setting-inline">
-        <label>开机自启</label>
-        <label class="switch-row">
+        <label>全局快捷键</label>
+        <div class="setting-actions">
           <input
-            :checked="launchAtStartup"
-            type="checkbox"
-            @change="emit('update:launchAtStartup', $event.target.checked)"
-          />
-          <span>{{ launchAtStartup ? "已启用" : "未启用" }}</span>
-        </label>
-      </div>
-
-      <div class="setting-row setting-inline">
-        <label>窗口置顶</label>
-        <label class="switch-row">
-          <input
-            :checked="alwaysOnTop"
-            type="checkbox"
-            @change="emit('update:alwaysOnTop', $event.target.checked)"
-          />
-          <span>{{ alwaysOnTop ? "已启用" : "未启用" }}</span>
-        </label>
-      </div>
-    </div>
-
-    <div class="setting-row">
-      <label>存储目录</label>
-      <div class="storage-dir-row">
-        <div class="storage-dir-display" :title="storageDir || '默认应用数据目录'">
-          <input
-            class="search compact-input storage-dir-input"
-            :value="storageDir || '默认应用数据目录'"
+            class="search compact-input"
+            :value="shortcutDraft"
             readonly
-            @click="emit('select-storage-dir')"
-            title="点击选择保存位置"
+            @keydown="emit('shortcut-keydown', $event)"
+            @click="emit('shortcut-click')"
+            @blur="emit('shortcut-blur')"
+            placeholder="点击输入框后按下组合键"
           />
         </div>
-        <div class="setting-actions storage-dir-actions">
-          <button class="chip" @click="emit('open-storage-dir')">打开目录</button>
-        </div>
       </div>
-    </div>
-
-    <div class="setting-row setting-inline">
-      <label>设备名称</label>
-      <input
-        :value="deviceName"
-        class="search compact-input"
-        placeholder="用于局域网识别"
-        style="min-width:120px"
-        @input="emit('update:deviceName', $event.target.value)"
-      />
-    </div>
-
-    <div class="setting-actions bottom-setting-actions">
-      <button
-        class="chip danger"
-        :class="{ 'danger-confirm': isClearHistoryConfirming }"
-        @click="emit('clear-history')"
-      >
-        {{ isClearHistoryConfirming ? "再次点击确认删除" : "删除全部历史" }}
-      </button>
-    </div>
-
-    <!-- 局域网剪切板共享 -->
-    <div class="setting-section">
-      <h3 class="setting-section-title">📶 局域网共享</h3>
 
       <div class="setting-row setting-inline">
-        <label>模式</label>
-        <div class="ws-mode-btns">
-          <button :class="['chip', { active: wsMode === 'disabled' }]" @click="emit('update:wsMode', 'disabled')">禁用</button>
-          <button :class="['chip', { active: wsMode === 'server' }]" @click="emit('update:wsMode', 'server')">作为主机</button>
-          <button :class="['chip', { active: wsMode === 'client' }]" @click="emit('update:wsMode', 'client')">加入主机</button>
+        <label>轮询间隔(ms)</label>
+        <input
+          :value="pollIntervalMs"
+          class="search compact-input"
+          type="number"
+          min="300"
+          max="5000"
+          @input="emit('update:pollIntervalMs', Number($event.target.value))"
+        />
+      </div>
+
+      <div class="setting-pair">
+        <div class="setting-row setting-inline">
+          <label>开机自启</label>
+          <label class="switch-row">
+            <input
+              :checked="launchAtStartup"
+              type="checkbox"
+              @change="emit('update:launchAtStartup', $event.target.checked)"
+            />
+            <span>{{ launchAtStartup ? "已启用" : "未启用" }}</span>
+          </label>
+        </div>
+
+        <div class="setting-row setting-inline">
+          <label>窗口置顶</label>
+          <label class="switch-row">
+            <input
+              :checked="alwaysOnTop"
+              type="checkbox"
+              @change="emit('update:alwaysOnTop', $event.target.checked)"
+            />
+            <span>{{ alwaysOnTop ? "已启用" : "未启用" }}</span>
+          </label>
         </div>
       </div>
 
-      <template v-if="wsMode === 'server'">
+      <div class="setting-row">
+        <label>数据存储目录</label>
+        <div class="storage-dir-row">
+          <div class="storage-dir-display" :title="storageDir || '默认应用数据目录'">
+            <input
+              class="search compact-input storage-dir-input"
+              :value="storageDir || '默认应用数据目录'"
+              readonly
+              @click="emit('select-storage-dir')"
+              title="点击选择保存位置"
+            />
+          </div>
+          <div class="setting-actions storage-dir-actions">
+            <button class="chip" @click="emit('open-storage-dir')">打开目录</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 回收策略 Tab -->
+    <div v-show="activeTab === 'storage'" class="settings-tab-content">
+      <div class="setting-section">
+        <h3 class="setting-section-title">📊 实时存储统计</h3>
+        <div class="storage-stats-row">
+          <span class="storage-stat">总计: {{ storageStats.historyCount || 0 }}</span>
+          <span class="storage-stat">文本: {{ storageStats.textCount || 0 }}</span>
+          <span class="storage-stat">图片: {{ storageStats.imageCount || 0 }}</span>
+          <span class="storage-stat">收藏: {{ storageStats.favoriteCount || 0 }}</span>
+          <span class="storage-stat">图片体积: {{ formatBytes(storageStats.imageStorageBytes || 0) }}</span>
+        </div>
+
+        <br>
+        <h3 class="setting-section-title">⚙️ 自动清理限制</h3>
         <div class="setting-row setting-inline">
-          <label>端口</label>
+          <label>历史记录总量</label>
           <input
-            :value="wsPort"
+            :value="historyLimit"
             class="search compact-input"
             type="number"
-            min="1024"
-            max="65535"
-            style="width:90px"
-            @input="emit('update:wsPort', Number($event.target.value))"
+            min="50"
+            max="5000"
+            style="width:80px"
+            @input="emit('update:historyLimit', Number($event.target.value))"
           />
         </div>
-        <div v-if="wsLocalIps.length > 1" class="setting-row setting-inline">
-          <label>绑定IP</label>
-          <select
-            :value="wsSelectedIp"
-            class="search compact-input"
-            style="min-width:150px"
-            @change="emit('update:wsSelectedIp', $event.target.value)"
-          >
-            <option v-for="ip in wsLocalIps" :key="ip" :value="ip">{{ ip }}</option>
-          </select>
-        </div>
-        <div v-else-if="wsLocalIps.length === 1" class="setting-row setting-inline">
-          <label>绑定IP</label>
-          <code class="ws-addr" style="margin-left:4px">{{ wsLocalIps[0] }}</code>
-        </div>
-        <div class="setting-row">
-          <div class="setting-actions">
-            <button v-if="!wsRunning" class="chip" :disabled="wsLoading" @click="emit('ws-start-server')">
-              {{ wsLoading ? '启动中...' : '启动' }}
-            </button>
-            <button v-else class="chip danger" :disabled="wsLoading" @click="emit('ws-stop-server')">
-              {{ wsLoading ? '停止中...' : '停止服务' }}
-            </button>
-          </div>
-        </div>
-        <div v-if="wsRunning && wsAddress" class="ws-address-box">
-          <span class="ws-label">其它设备输入：</span>
-          <code class="ws-addr">{{ wsAddress }}</code>
-        </div>
-      </template>
 
-      <template v-if="wsMode === 'client'">
         <div class="setting-row setting-inline">
-          <label>服务器地址</label>
+          <label>文本保留天数</label>
           <input
-            :value="wsUrl"
+            :value="textRetentionDays"
             class="search compact-input"
-            placeholder="ws://192.168.1.x:9521"
-            style="min-width:180px"
-            @input="emit('update:wsUrl', $event.target.value)"
+            type="number"
+            min="0"
+            max="365"
+            style="width:80px"
+            @input="emit('update:textRetentionDays', Number($event.target.value))"
+          />
+          <span class="setting-hint">0=不限制</span>
+        </div>
+
+        <div class="setting-row setting-inline">
+          <label>图片保留天数</label>
+          <input
+            :value="imageRetentionDays"
+            class="search compact-input"
+            type="number"
+            min="0"
+            max="365"
+            style="width:80px"
+            @input="emit('update:imageRetentionDays', Number($event.target.value))"
+          />
+          <span class="setting-hint">0=不限制</span>
+        </div>
+
+        <div class="setting-row setting-inline">
+          <label>图片存储上限(MB)</label>
+          <input
+            :value="maxStorageMb"
+            class="search compact-input"
+            type="number"
+            min="0"
+            max="10000"
+            style="width:80px"
+            @input="emit('update:maxStorageMb', Number($event.target.value))"
+          />
+          <span class="setting-hint">0=不限制</span>
+        </div>
+
+        <div class="setting-actions bottom-setting-actions" style="margin-top: 24px;">
+          <button
+            class="chip danger"
+            :class="{ 'danger-confirm': isClearHistoryConfirming }"
+            @click="emit('clear-history')"
+          >
+            {{ isClearHistoryConfirming ? "再次点击确认删除" : "清空全部" }}
+          </button>
+          <button class="chip" @click="emit('save-settings')">立即生效并清理</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 局域网同步 Tab -->
+    <div v-show="activeTab === 'network'" class="settings-tab-content">
+      <div class="setting-section">
+        <h3 class="setting-section-title">📶 WebSocket 设备互通</h3>
+
+        <div class="setting-row setting-inline">
+          <label>识别名称</label>
+          <input
+            :value="deviceName"
+            class="search compact-input"
+            placeholder="例如: MacBook Pro"
+            style="min-width:120px"
+            @input="emit('update:deviceName', $event.target.value)"
           />
         </div>
-        <div v-if="wsLocalIps.length" class="ws-ips">
-          <span class="ws-label">本机 IP：</span>
-          <code v-for="ip in wsLocalIps" :key="ip" class="ws-addr" style="margin-right:6px">{{ ip }}</code>
-        </div>
-        <div class="setting-row">
-          <div class="setting-actions">
-            <button v-if="!wsRunning" class="chip" :disabled="wsLoading" @click="emit('ws-connect-client')">
-              {{ wsLoading ? '连接中...' : '连接' }}
-            </button>
-            <button v-else class="chip danger" :disabled="wsLoading" @click="emit('ws-disconnect-client')">
-              {{ wsLoading ? '断开中...' : '断开' }}
-            </button>
+        <hr style="border:0; border-top: 1px solid rgba(255,255,255,0.05); margin: 16px 0;" />
+
+        <div class="setting-row setting-inline">
+          <label>运行模式</label>
+          <div class="ws-mode-btns">
+            <button :class="['chip', { active: wsMode === 'disabled' }]" @click="emit('update:wsMode', 'disabled')">未开启</button>
+            <button :class="['chip', { active: wsMode === 'server' }]" @click="emit('update:wsMode', 'server')">作为总机</button>
+            <button :class="['chip', { active: wsMode === 'client' }]" @click="emit('update:wsMode', 'client')">连接总机</button>
           </div>
         </div>
-        <div class="ws-status-row">
-          <span class="ws-dot" :class="{ connected: wsRunning }"></span>
-          <span>{{ wsRunning ? '已连接' : '未连接' }}</span>
-        </div>
-      </template>
+
+        <template v-if="wsMode === 'server'">
+          <div class="setting-row setting-inline">
+            <label>通讯端口</label>
+            <input
+              :value="wsPort"
+              class="search compact-input"
+              type="number"
+              min="1024"
+              max="65535"
+              style="width:90px"
+              @input="emit('update:wsPort', Number($event.target.value))"
+            />
+          </div>
+          <div v-if="wsLocalIps.length > 1" class="setting-row setting-inline">
+            <label>内网 IP</label>
+            <select
+              :value="wsSelectedIp"
+              class="search compact-input"
+              style="min-width:150px"
+              @change="emit('update:wsSelectedIp', $event.target.value)"
+            >
+              <option v-for="ip in wsLocalIps" :key="ip" :value="ip">{{ ip }}</option>
+            </select>
+          </div>
+          <div v-else-if="wsLocalIps.length === 1" class="setting-row setting-inline">
+            <label>内网 IP</label>
+            <code class="ws-addr" style="margin-left:4px">{{ wsLocalIps[0] }}</code>
+          </div>
+          <div class="setting-row">
+            <div class="setting-actions">
+              <button v-if="!wsRunning" class="chip" :disabled="wsLoading" @click="emit('ws-start-server')">
+                {{ wsLoading ? '正在启动...' : '开启广播服务' }}
+              </button>
+              <button v-else class="chip danger" :disabled="wsLoading" @click="emit('ws-stop-server')">
+                {{ wsLoading ? '正在关闭...' : '关闭广播服务' }}
+              </button>
+            </div>
+          </div>
+          <div v-if="wsRunning && wsAddress" class="ws-address-box">
+            <span class="ws-label">分机配对地址：</span>
+            <code class="ws-addr">{{ wsAddress }}</code>
+          </div>
+        </template>
+
+        <template v-if="wsMode === 'client'">
+          <div class="setting-row setting-inline">
+            <label>总机地址</label>
+            <input
+              :value="wsUrl"
+              class="search compact-input"
+              placeholder="ws://192.168.1.x:9521"
+              style="min-width:180px"
+              @input="emit('update:wsUrl', $event.target.value)"
+            />
+          </div>
+          <div v-if="wsLocalIps.length" class="ws-ips" style="margin-bottom: 12px; opacity: 0.7;">
+            <span class="ws-label">本机 IP：</span>
+            <code v-for="ip in wsLocalIps" :key="ip" class="ws-addr" style="margin-right:6px">{{ ip }}</code>
+          </div>
+          <div class="setting-row">
+            <div class="setting-actions" style="margin-top: 8px;">
+              <button v-if="!wsRunning" class="chip" :disabled="wsLoading" @click="emit('ws-connect-client')">
+                {{ wsLoading ? '连接中...' : '发起连接' }}
+              </button>
+              <button v-else class="chip danger" :disabled="wsLoading" @click="emit('ws-disconnect-client')">
+                {{ wsLoading ? '断开中...' : '主动断开' }}
+              </button>
+            </div>
+          </div>
+          <div class="ws-status-row">
+            <span class="ws-dot" :class="{ connected: wsRunning }"></span>
+            <span>{{ wsRunning ? '已接入服务' : '休眠中 / 离线' }}</span>
+          </div>
+        </template>
+      </div>
     </div>
   </div>
 </template>

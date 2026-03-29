@@ -47,6 +47,23 @@ struct AppSettings {
     text_retention_days: u32,
     image_retention_days: u32,
     max_storage_mb: u32,
+    /// WebSocket 运行模式："disabled" | "server" | "client"
+    #[serde(default = "default_ws_mode")]
+    ws_mode: String,
+    /// WebSocket 总机端口
+    #[serde(default = "default_ws_server_port")]
+    ws_server_port: u16,
+    /// WebSocket 客户端连接地址
+    #[serde(default)]
+    ws_client_url: String,
+}
+
+fn default_ws_mode() -> String {
+    "disabled".to_string()
+}
+
+fn default_ws_server_port() -> u16 {
+    9521
 }
 
 impl Default for AppSettings {
@@ -67,6 +84,9 @@ impl Default for AppSettings {
             text_retention_days: 30,
             image_retention_days: 7,
             max_storage_mb: 500,
+            ws_mode: "disabled".to_string(),
+            ws_server_port: 9521,
+            ws_client_url: String::new(),
         }
     }
 }
@@ -84,6 +104,9 @@ struct UpdateSettingsPayload {
     text_retention_days: Option<u32>,
     image_retention_days: Option<u32>,
     max_storage_mb: Option<u32>,
+    ws_mode: Option<String>,
+    ws_server_port: Option<u16>,
+    ws_client_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +254,14 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     } else {
         settings.device_name = settings.device_name.trim().to_string();
     }
+    // WebSocket 设置校验
+    if !matches!(settings.ws_mode.as_str(), "disabled" | "server" | "client") {
+        settings.ws_mode = "disabled".to_string();
+    }
+    if settings.ws_server_port == 0 {
+        settings.ws_server_port = 9521;
+    }
+    settings.ws_client_url = settings.ws_client_url.trim().to_string();
     settings
 }
 
@@ -712,12 +743,34 @@ fn apply_storage_limit(
 
     let limit_bytes = u64::from(settings.max_storage_mb).saturating_mul(1024 * 1024);
     let mut trimmed = items;
+    let mut total_bytes = estimate_history_storage_bytes(app, &trimmed)?;
 
-    while estimate_history_storage_bytes(app, &trimmed)? > limit_bytes {
-        let Some(remove_idx) = trimmed.iter().rposition(|item| !item.is_favorite) else {
+    if total_bytes <= limit_bytes {
+        return Ok(trimmed);
+    }
+
+    let base_dir = data_dir(app)?;
+
+    for i in (0..trimmed.len()).rev() {
+        if total_bytes <= limit_bytes {
             break;
-        };
-        trimmed.remove(remove_idx);
+        }
+
+        if !trimmed[i].is_favorite {
+            let item = &trimmed[i];
+            
+            let mut item_storage_bytes = serde_json::to_vec(&item).unwrap_or_default().len() as u64;
+            
+            if let Some(rel) = item.image_path.as_deref() {
+                let path = base_dir.join(rel);
+                if let Ok(meta) = fs::metadata(path) {
+                    item_storage_bytes = item_storage_bytes.saturating_add(meta.len());
+                }
+            }
+
+            trimmed.remove(i);
+            total_bytes = total_bytes.saturating_sub(item_storage_bytes);
+        }
     }
 
     Ok(trimmed)
@@ -1302,7 +1355,7 @@ fn open_storage_dir(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<AppSettings, String> {
+fn update_settings(payload: UpdateSettingsPayload, app: AppHandle, state: State<'_, AppState>) -> Result<AppSettings, String> {
     let current = load_settings(&app)?;
     let old_dir = data_dir_from_settings(&app, &current)?;
 
@@ -1337,6 +1390,15 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
     if let Some(v) = payload.max_storage_mb {
         next.max_storage_mb = v;
     }
+    if let Some(v) = payload.ws_mode {
+        next.ws_mode = v;
+    }
+    if let Some(v) = payload.ws_server_port {
+        next.ws_server_port = v;
+    }
+    if let Some(v) = payload.ws_client_url {
+        next.ws_client_url = v.trim().to_string();
+    }
     next = normalize_settings(next);
 
     let new_dir = data_dir_from_settings(&app, &next)?;
@@ -1349,10 +1411,17 @@ fn update_settings(payload: UpdateSettingsPayload, app: AppHandle) -> Result<App
     save_settings(&app, &next)?;
 
     // Apply cleanup after settings changed
+    let _guard = state
+        .history_lock
+        .lock()
+        .map_err(|_| "历史锁获取失败".to_string())?;
+
     let mut items = load_history(&app)?;
     items = prepare_history_items(&app, items, &next)?;
     save_history(&app, &items)?;
     cleanup_orphaned_images(&app, &items)?;
+
+    drop(_guard);
 
     register_global_shortcut(&app, &next.global_shortcut)?;
     if let Err(err) = set_autostart_enabled(&app, next.launch_at_startup) {
@@ -1695,7 +1764,12 @@ fn copy_text(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn toggle_favorite(id: String, app: AppHandle) -> Result<Option<ClipboardItem>, String> {
+fn toggle_favorite(id: String, app: AppHandle, state: State<'_, AppState>) -> Result<Option<ClipboardItem>, String> {
+    let _guard = state
+        .history_lock
+        .lock()
+        .map_err(|_| "历史锁获取失败".to_string())?;
+
     let mut items = load_history_clean(&app)?;
     let mut updated: Option<ClipboardItem> = None;
 
@@ -1708,17 +1782,17 @@ fn toggle_favorite(id: String, app: AppHandle) -> Result<Option<ClipboardItem>, 
         }
     }
 
-        if let Some(ref changed) = updated {
-            items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            if let Some(idx) = items.iter().position(|it| it.id == changed.id) {
-                let item = items.remove(idx);
-                items.insert(0, item);
-            }
-            let settings = load_settings(&app)?;
-            items = prepare_history_items(&app, items, &settings)?;
-            save_history(&app, &items)?;
-            cleanup_orphaned_images(&app, &items)?;
+    if let Some(ref changed) = updated {
+        items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        if let Some(idx) = items.iter().position(|it| it.id == changed.id) {
+            let item = items.remove(idx);
+            items.insert(0, item);
         }
+        let settings = load_settings(&app)?;
+        items = prepare_history_items(&app, items, &settings)?;
+        save_history(&app, &items)?;
+        cleanup_orphaned_images(&app, &items)?;
+    }
 
     Ok(updated)
 }
@@ -1801,6 +1875,108 @@ fn suppress_auto_hide(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+
+// ─── WebSocket 持久化辅助 ────────────────────────────────────────────────────
+
+/// 将当前 WebSocket 模式/端口/地址写入 settings.json（最佳努力，不阻塞）
+fn persist_ws_settings(app: &AppHandle, mode: &str, port: u16, client_url: &str) {
+    if let Ok(mut settings) = load_settings_from_disk(app) {
+        settings.ws_mode = mode.to_string();
+        settings.ws_server_port = port;
+        settings.ws_client_url = client_url.to_string();
+        if let Err(e) = save_settings(app, &settings) {
+            append_log(app, "WARN", &format!("persist ws settings failed: {e}"));
+        }
+    }
+}
+
+/// 应用启动时根据持久化的 ws_mode 自动启动/连接 WebSocket
+fn auto_start_ws(app_handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let settings = match load_settings(&app_handle) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        match settings.ws_mode.as_str() {
+            "server" => {
+                let port = settings.ws_server_port;
+                let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let app_clone = app_handle.clone();
+                tokio::spawn(async move {
+                    while let Some(json) = app_rx.recv().await {
+                        handle_received_clipboard(&app_clone, json).await;
+                    }
+                });
+
+                let state = app_handle.state::<AppState>();
+                let result = {
+                    let mut server = state.ws_server.lock().await;
+                    server.start(port, app_tx).await
+                };
+                match result {
+                    Ok(actual_port) => {
+                        append_log(&app_handle, "INFO", &format!("auto-start ws server on port {actual_port}"));
+                    }
+                    Err(e) => {
+                        append_log(&app_handle, "WARN", &format!("auto-start ws server failed: {e}"));
+                        // 启动失败，重置 ws_mode 避免下次再失败
+                        persist_ws_settings(&app_handle, "disabled", port, "");
+                    }
+                }
+            }
+            "client" => {
+                let url = settings.ws_client_url.clone();
+                if url.is_empty() {
+                    return;
+                }
+
+                let (app_tx, mut app_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let app_clone = app_handle.clone();
+                tokio::spawn(async move {
+                    while let Some(json) = app_rx.recv().await {
+                        if json == "__disconnected__" {
+                            let _ = app_clone.emit("ws-status-changed", serde_json::json!({
+                                "connected": false,
+                                "mode": "client"
+                            }));
+                            continue;
+                        }
+                        if json == "__reconnect_needed__" {
+                            let _ = app_clone.emit("ws-reconnect-needed", ());
+                            continue;
+                        }
+                        if json == "__reconnected__" {
+                            let _ = app_clone.emit("ws-status-changed", serde_json::json!({
+                                "connected": true,
+                                "mode": "client"
+                            }));
+                            continue;
+                        }
+                        handle_received_clipboard(&app_clone, json).await;
+                    }
+                });
+
+                let state = app_handle.state::<AppState>();
+                let result = {
+                    let mut client = state.ws_client.lock().await;
+                    client.connect(&url, app_tx).await
+                };
+                match result {
+                    Ok(()) => {
+                        append_log(&app_handle, "INFO", &format!("auto-connect ws client to {url}"));
+                    }
+                    Err(e) => {
+                        append_log(&app_handle, "WARN", &format!("auto-connect ws client failed: {e}"));
+                        // 连接失败不重置 ws_mode，让前端重连机制处理
+                    }
+                }
+            }
+            _ => {} // disabled, 不做任何操作
+        }
+    });
+}
+
 // ─── WebSocket 命令 ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -1835,6 +2011,9 @@ async fn ws_start_server(
         server.start(port, app_tx).await?
     };
 
+    // 持久化 WebSocket 配置
+    persist_ws_settings(&app, "server", actual_port, "");
+
     let ips = get_local_ip_list();
     let first_addr = ips
         .first()
@@ -1850,8 +2029,10 @@ async fn ws_start_server(
 
 /// 停止 WebSocket Server
 #[tauri::command]
-async fn ws_stop_server(state: State<'_, AppState>) -> Result<WsStatus, String> {
+async fn ws_stop_server(app: AppHandle, state: State<'_, AppState>) -> Result<WsStatus, String> {
     state.ws_server.lock().await.stop().await;
+    // 持久化 WebSocket 配置
+    persist_ws_settings(&app, "disabled", 9521, "");
     Ok(WsStatus {
         mode: "disabled".to_string(),
         running: false,
@@ -1902,6 +2083,9 @@ async fn ws_connect_client(
 
     state.ws_client.lock().await.connect(&url, app_tx).await?;
 
+    // 持久化 WebSocket 配置
+    persist_ws_settings(&app, "client", 9521, &url);
+
     Ok(WsStatus {
         mode: "client".to_string(),
         running: true,
@@ -1912,8 +2096,10 @@ async fn ws_connect_client(
 
 /// 断开 Client 连接
 #[tauri::command]
-async fn ws_disconnect_client(state: State<'_, AppState>) -> Result<WsStatus, String> {
+async fn ws_disconnect_client(app: AppHandle, state: State<'_, AppState>) -> Result<WsStatus, String> {
     state.ws_client.lock().await.disconnect().await;
+    // 持久化 WebSocket 配置
+    persist_ws_settings(&app, "disabled", 9521, "");
     Ok(WsStatus {
         mode: "disabled".to_string(),
         running: false,
@@ -2101,18 +2287,20 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
 
         // 插入历史记录
         if let Ok(settings) = load_settings(app) {
-            if let Ok(mut items) = load_history(app) {
-                dedupe_and_upsert(&mut items, item, &settings);
-                let fallback_items = items.clone();
-                let items = match prepare_history_items(app, items, &settings) {
-                    Ok(items) => items,
-                    Err(err) => {
-                        append_log(app, "WARN", &format!("prepare synced text history failed: {err}"));
-                        fallback_items
-                    }
-                };
-                let _ = save_history(app, &items);
-                let _ = cleanup_orphaned_images(app, &items);
+            if let Ok(_guard) = state.history_lock.lock() {
+                if let Ok(mut items) = load_history(app) {
+                    dedupe_and_upsert(&mut items, item, &settings);
+                    let fallback_items = items.clone();
+                    let items = match prepare_history_items(app, items, &settings) {
+                        Ok(items) => items,
+                        Err(err) => {
+                            append_log(app, "WARN", &format!("prepare synced text history failed: {err}"));
+                            fallback_items
+                        }
+                    };
+                    let _ = save_history(app, &items);
+                    let _ = cleanup_orphaned_images(app, &items);
+                }
             }
         }
 
@@ -2161,18 +2349,20 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
 
                 // 插入历史记录
                 if let Ok(settings) = load_settings(app) {
-                    if let Ok(mut items) = load_history(app) {
-                        dedupe_and_upsert(&mut items, item, &settings);
-                        let fallback_items = items.clone();
-                        let items = match prepare_history_items(app, items, &settings) {
-                            Ok(items) => items,
-                            Err(err) => {
-                                append_log(app, "WARN", &format!("prepare synced image history failed: {err}"));
-                                fallback_items
-                            }
-                        };
-                        let _ = save_history(app, &items);
-                        let _ = cleanup_orphaned_images(app, &items);
+                    if let Ok(_guard) = state.history_lock.lock() {
+                        if let Ok(mut items) = load_history(app) {
+                            dedupe_and_upsert(&mut items, item, &settings);
+                            let fallback_items = items.clone();
+                            let items = match prepare_history_items(app, items, &settings) {
+                                Ok(items) => items,
+                                Err(err) => {
+                                    append_log(app, "WARN", &format!("prepare synced image history failed: {err}"));
+                                    fallback_items
+                                }
+                            };
+                            let _ = save_history(app, &items);
+                            let _ = cleanup_orphaned_images(app, &items);
+                        }
                     }
                 }
 
@@ -2249,6 +2439,10 @@ pub fn run() {
                     &format!("setup always-on-top failed: {err}"),
                 );
             }
+
+            // 根据持久化的 ws_mode 自动启动/连接 WebSocket
+            auto_start_ws(app.handle().clone());
+
             Ok(())
         })
         .on_window_event(|window, event| {

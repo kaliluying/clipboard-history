@@ -99,6 +99,39 @@ watch(wsMode, (newMode) => {
   }
 });
 
+const selectedIndex = ref(-1);
+
+watch(keyword, () => {
+  selectedIndex.value = -1;
+});
+
+function handleGlobalKeydown(e) {
+  if (page.value !== "history") return;
+  if (isClearHistoryConfirming.value || expandedTextItem.value) return;
+
+  const len = visibleHistory.value.length;
+  if (len === 0) return;
+
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    selectedIndex.value = selectedIndex.value < len - 1 ? selectedIndex.value + 1 : len - 1;
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    selectedIndex.value = selectedIndex.value > 0 ? selectedIndex.value - 1 : 0;
+  } else if (e.key === "Enter") {
+    if (selectedIndex.value >= 0 && selectedIndex.value < len) {
+      e.preventDefault();
+      void copyItem(visibleHistory.value[selectedIndex.value]);
+    }
+  } else if (e.altKey && e.key >= "1" && e.key <= "9") {
+    e.preventDefault();
+    const index = parseInt(e.key) - 1;
+    if (index < len) {
+      void copyItem(visibleHistory.value[index]);
+    }
+  }
+}
+
 async function loadWsStatus() {
   try {
     const status = await invoke("ws_get_status");
@@ -361,6 +394,16 @@ async function loadSettings() {
   }
   if (settings && typeof settings.maxStorageMb === "number") {
     maxStorageMb.value = settings.maxStorageMb;
+  }
+  // 读取持久化的 WebSocket 配置
+  if (settings && typeof settings.wsMode === "string") {
+    wsMode.value = settings.wsMode;
+  }
+  if (settings && typeof settings.wsServerPort === "number") {
+    wsPort.value = settings.wsServerPort;
+  }
+  if (settings && typeof settings.wsClientUrl === "string" && settings.wsClientUrl.trim()) {
+    wsUrl.value = settings.wsClientUrl;
   }
 
   // Load storage stats
@@ -638,6 +681,9 @@ async function saveSettings() {
         textRetentionDays: Number(textRetentionDays.value),
         imageRetentionDays: Number(imageRetentionDays.value),
         maxStorageMb: Number(maxStorageMb.value),
+        wsMode: wsMode.value,
+        wsServerPort: wsPort.value,
+        wsClientUrl: wsUrl.value.trim(),
       },
     });
 
@@ -736,6 +782,8 @@ onMounted(async () => {
   // 加载本机 IP 和 WebSocket 状态
   await loadLocalIps();
   await loadWsStatus();
+
+  window.addEventListener("keydown", handleGlobalKeydown);
 });
 
 watch(
@@ -756,6 +804,7 @@ watch([pollIntervalMs, shortcutDraft, launchAtStartup, alwaysOnTop, storageDir, 
 });
 
 onUnmounted(() => {
+  window.removeEventListener("keydown", handleGlobalKeydown);
   if (timer !== null) {
     window.clearInterval(timer);
   }
@@ -873,6 +922,7 @@ onUnmounted(() => {
       :items="visibleHistory"
       :copiedItemId="copiedItemId"
       :imagePreviewMap="imagePreviewMap"
+      :selectedIndex="selectedIndex"
       @copy-item="copyItem"
       @toggle-favorite="toggleFavorite"
       @delete-item="deleteItem"
@@ -906,7 +956,7 @@ onUnmounted(() => {
 
 body {
   margin: 0;
-  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   color: var(--text-main);
   background: linear-gradient(145deg, var(--bg-top), var(--bg-bottom));
   min-height: 100vh;
@@ -1572,7 +1622,7 @@ time {
 
 .ws-addr {
   color: var(--accent);
-  font-family: monospace;
+  font-family: "JetBrains Mono", monospace;
   font-size: 12px;
   word-break: break-all;
 }
