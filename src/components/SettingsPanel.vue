@@ -1,7 +1,9 @@
 <script setup>
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 
-defineProps({
+const isMac = computed(() => typeof navigator !== 'undefined' && /Mac|iPhone|iPod|iPad/.test(navigator.platform));
+
+const props = defineProps({
   // 基本设置
   shortcutDraft: { type: String, required: true },
   pollIntervalMs: { type: Number, required: true },
@@ -66,6 +68,20 @@ function formatBytes(bytes) {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
+
+const displayShortcut = computed(() => {
+  if (!props.shortcutDraft) return "";
+  let res = props.shortcutDraft;
+  if (isMac.value) {
+    res = res.replace(/Super/g, "⌘ Command")
+             .replace(/Alt/g, "⌥ Option")
+             .replace(/Shift/g, "⇧ Shift")
+             .replace(/Ctrl/g, "⌃ Control");
+  } else {
+    res = res.replace(/Super/g, "Win");
+  }
+  return res;
+});
 </script>
 
 <template>
@@ -86,7 +102,7 @@ function formatBytes(bytes) {
         <div class="setting-actions">
           <input
             class="search compact-input"
-            :value="shortcutDraft"
+            :value="displayShortcut"
             readonly
             @keydown="emit('shortcut-keydown', $event)"
             @click="emit('shortcut-click')"

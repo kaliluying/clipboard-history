@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { hide } from "@tauri-apps/api/app";
 import HistoryList from "./components/HistoryList.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import TextPreviewModal from "./components/TextPreviewModal.vue";
@@ -39,6 +40,7 @@ const copiedItemId = ref("");
 const copyBubble = ref({ visible: false, x: 0, y: 0, key: 0 });
 const isClearHistoryConfirming = ref(false);
 const appWindow = getCurrentWindow();
+const searchInput = ref(null);
 
 let timer = null;
 let saveSettingsTimer = null;
@@ -49,6 +51,7 @@ let isHydratingSettings = true;
 let unlistenClipboardSynced = null;
 let unlistenWsStatusChanged = null;
 let unlistenWsReconnectNeeded = null;
+let unlistenFocus = null;
 
 // WebSocket 局域网共享
 const wsMode = ref("disabled"); // "disabled" | "server" | "client"
@@ -103,6 +106,16 @@ const selectedIndex = ref(-1);
 
 watch(keyword, () => {
   selectedIndex.value = -1;
+});
+
+let noticeTimer = null;
+watch(notice, (newVal) => {
+  if (newVal) {
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => {
+      notice.value = "";
+    }, 3500);
+  }
 });
 
 function handleGlobalKeydown(e) {
@@ -446,10 +459,13 @@ async function openStorageDir() {
 
 async function hideWindow() {
   try {
-    await appWindow.hide();
-  } catch (error) {
-    console.error("hide window failed", error);
-    notice.value = "窗口隐藏失败，请检查权限配置";
+    await hide();
+  } catch (e) {
+    try {
+      await appWindow.hide();
+    } catch (error) {
+      console.error("hide window failed", error);
+    }
   }
 }
 
@@ -561,12 +577,16 @@ async function copyItem(item, event) {
       if (selectedText) {
         await invoke("copy_text", { text: selectedText });
         showCopyFeedback(item.id, event);
+        await hideWindow();
+        setTimeout(() => { invoke("auto_paste"); }, 50);
         return;
       }
     }
 
     await invoke("copy_history_item", { id: item.id });
     showCopyFeedback(item.id, event);
+    await hideWindow();
+    setTimeout(() => { invoke("auto_paste"); }, 50);
   } catch (error) {
     console.error("copy_history_item failed", error);
     notice.value = "回填失败";
@@ -588,6 +608,9 @@ async function copyExpandedText() {
   try {
     await invoke("copy_text", { text });
     notice.value = "";
+    closeTextPreview();
+    await hideWindow();
+    setTimeout(() => { invoke("auto_paste"); }, 50);
   } catch (error) {
     console.error("copy expanded text failed", error);
     notice.value = "回填失败";
@@ -779,6 +802,18 @@ onMounted(async () => {
     }
   });
 
+  // 监听窗口激活，自动聚焦搜索并重置状态
+  unlistenFocus = await appWindow.onFocusChanged(({ payload: focused }) => {
+    if (focused && page.value === "history") {
+      keyword.value = "";
+      filter.value = "all";
+      selectedIndex.value = -1;
+      setTimeout(() => {
+        searchInput.value?.focus();
+      }, 50);
+    }
+  });
+
   // 加载本机 IP 和 WebSocket 状态
   await loadLocalIps();
   await loadWsStatus();
@@ -829,6 +864,9 @@ onUnmounted(() => {
   if (unlistenWsReconnectNeeded) {
     unlistenWsReconnectNeeded();
   }
+  if (unlistenFocus) {
+    unlistenFocus();
+  }
 });
 </script>
 
@@ -861,7 +899,10 @@ onUnmounted(() => {
         </div>
 
         <div class="actions-row">
-          <input v-model="keyword" class="search" placeholder="搜索文本内容" />
+          <div class="search-wrapper">
+            <input ref="searchInput" v-model="keyword" class="search" placeholder="搜索文本内容" />
+            <button v-show="keyword" class="search-clear-btn" @click="keyword = ''">×</button>
+          </div>
         </div>
       </template>
 
@@ -913,13 +954,19 @@ onUnmounted(() => {
           @ws-disconnect-client="wsDisconnectClient"
         />
       </template>
-
-      <p v-if="notice" class="notice">{{ notice }}</p>
     </section>
+
+    <Transition name="toast">
+      <div v-if="notice" class="toast-notification">
+        {{ notice }}
+      </div>
+    </Transition>
 
     <HistoryList
       v-if="page === 'history'"
       :items="visibleHistory"
+      :keyword="keyword"
+      :totalCount="history.length"
       :copiedItemId="copiedItemId"
       :imagePreviewMap="imagePreviewMap"
       :selectedIndex="selectedIndex"
@@ -954,18 +1001,19 @@ onUnmounted(() => {
   box-sizing: border-box;
 }
 
-body {
+html,
+body,
+#app {
   margin: 0;
-  font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  color: var(--text-main);
-  background: linear-gradient(145deg, var(--bg-top), var(--bg-bottom));
-  min-height: 100vh;
-  overflow-x: hidden;
+  padding: 0;
+  background: transparent !important;
+  height: 100vh;
+  overflow: hidden;
 }
 
-html,
-#app {
-  overflow-x: hidden;
+body {
+  font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--text-main);
 }
 
 * {
@@ -989,11 +1037,15 @@ html,
 
 .app-shell {
   position: relative;
-  min-height: 100vh;
+  height: 100vh;
   padding: 8px 8px 10px;
   max-width: 450px;
   margin: 0 auto;
-  overflow-x: hidden;
+  background: linear-gradient(145deg, var(--bg-top), var(--bg-bottom));
+  overflow: hidden;
+  border-radius: 14px;
+  /* Ensure no border clipping artifacts */
+  box-sizing: border-box;
 }
 
 .copy-bubble {
@@ -1047,12 +1099,22 @@ html,
 .titlebar-btn {
   width: 22px;
   height: 22px;
-  border: 1px solid rgba(255, 255, 255, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.25);
+  background: rgba(255, 255, 255, 0.05);
   color: #e2e8f0;
   cursor: pointer;
   line-height: 1;
+  transition: all 0.2s ease;
+  display: grid;
+  place-items: center;
+}
+
+.titlebar-btn:hover {
+  background: rgba(239, 68, 68, 0.8);
+  border-color: rgba(248, 113, 113, 1);
+  color: white;
+  transform: scale(1.05);
 }
 
 .ambient {
@@ -1081,12 +1143,12 @@ html,
 
 .panel {
   position: relative;
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-  border-radius: 18px;
-  box-shadow: 0 10px 35px rgba(2, 6, 23, 0.35);
+  background: rgba(255, 255, 255, 0.08); /* slightly softer */
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
 }
 
 .controls {
@@ -1196,6 +1258,41 @@ html,
   align-items: center;
 }
 
+/* Modern Toggle Switch */
+.switch-row input[type="checkbox"] {
+  appearance: none;
+  width: 38px;
+  height: 22px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 999px;
+  position: relative;
+  cursor: pointer;
+  outline: none;
+  transition: background 0.3s ease;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.switch-row input[type="checkbox"]::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+}
+
+.switch-row input[type="checkbox"]:checked {
+  background: var(--accent-strong);
+}
+
+.switch-row input[type="checkbox"]:checked::after {
+  transform: translateX(16px);
+}
+
 .storage-dir-display {
   width: 100%;
   white-space: nowrap;
@@ -1229,12 +1326,18 @@ html,
 }
 
 .chip {
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  background: rgba(15, 23, 42, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.07);
   color: var(--text-main);
   border-radius: 999px;
-  padding: 7px 12px;
+  padding: 7px 14px;
   cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.chip:hover {
+  background: rgba(255, 255, 255, 0.12);
+  transform: translateY(-1px);
 }
 
 .chip.active {
@@ -1278,25 +1381,92 @@ html,
 
 .search {
   width: 100%;
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  background: rgba(15, 23, 42, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(0, 0, 0, 0.2);
   border-radius: 12px;
   color: var(--text-main);
-  padding: 9px 11px;
+  padding: 10px 14px;
+  transition: all 0.2s ease;
+  outline: none;
+}
+
+.search:focus {
+  border-color: rgba(34, 211, 238, 0.5);
+  background: rgba(0, 0, 0, 0.3);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.15);
 }
 
 .compact-input {
-  padding: 7px 10px;
+  padding: 8px 12px;
 }
 
 .search::placeholder {
   color: #94a3b8;
 }
 
-.notice {
-  margin: 0;
+.search-wrapper {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+.search-wrapper .search {
+  padding-right: 36px;
+}
+
+.search-clear-btn {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  border-radius: 999px;
+  width: 18px;
+  height: 18px;
+  color: #fff;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  transition: background 0.2s ease;
+}
+
+.search-clear-btn:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.toast-notification {
+  position: absolute;
+  top: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(15, 23, 42, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #e2e8f0;
+  padding: 8px 16px;
+  border-radius: 999px;
   font-size: 12px;
-  color: #cbd5e1;
+  z-index: 100;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translate(-50%, -15px) scale(0.95);
 }
 
 .history-list {
@@ -1309,18 +1479,19 @@ html,
 }
 
 .history-item {
-  padding: 10px;
+  padding: 12px;
   cursor: pointer;
-  transition: transform 0.12s ease, border-color 0.12s ease;
-  background: rgba(15, 23, 42, 0.35);
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  box-shadow: 0 6px 18px rgba(2, 6, 23, 0.2);
+  transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), border-color 0.2s ease, box-shadow 0.2s ease;
+  background: rgba(15, 23, 42, 0.4);
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  box-shadow: 0 4px 15px rgba(2, 6, 23, 0.15);
 }
 
 .history-item:hover {
-  transform: translateY(-1px);
+  transform: translateY(-2px) scale(1.005);
   border-color: rgba(34, 211, 238, 0.45);
+  box-shadow: 0 8px 25px rgba(2, 6, 23, 0.3);
 }
 
 .history-item.copied {
@@ -1350,9 +1521,11 @@ html,
 .tag {
   display: inline-flex;
   border-radius: 999px;
-  font-size: 12px;
+  font-size: 11px;
   padding: 4px 10px;
   font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
 .tag.text {
@@ -1368,6 +1541,11 @@ html,
 time {
   font-size: 12px;
   color: #94a3b8;
+  transition: opacity 0.2s ease;
+}
+
+.history-item:hover time {
+  opacity: 0;
 }
 
 .text-preview {
@@ -1381,13 +1559,21 @@ time {
 
 .text-expand-btn {
   margin-top: 0;
-  border: 1px solid rgba(255, 255, 255, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.3);
+  background: rgba(255, 255, 255, 0.05);
   color: #cbd5e1;
-  padding: 5px 10px;
-  font-size: 12px;
+  padding: 5px 12px;
+  font-size: 11px;
+  font-weight: 500;
   cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.text-expand-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  transform: translateY(-1px);
 }
 
 .text-modal-mask {
@@ -1404,10 +1590,11 @@ time {
   width: min(100%, 680px);
   max-width: 100%;
   max-height: calc(100vh - 24px);
-  padding: 12px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
+  border-radius: 20px;
 }
 
 .text-modal-header,
@@ -1418,12 +1605,21 @@ time {
 }
 
 .text-modal-close {
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  background: rgba(15, 23, 42, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.05);
   color: #cbd5e1;
   border-radius: 999px;
-  padding: 6px 10px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.text-modal-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  transform: translateY(-1px);
 }
 
 .text-modal-content {
@@ -1432,10 +1628,10 @@ time {
   word-break: break-word;
   line-height: 1.6;
   color: #e2e8f0;
-  background: rgba(15, 23, 42, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 12px;
-  padding: 12px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  padding: 16px;
   max-height: calc(100vh - 180px);
   overflow: auto;
 }
@@ -1443,8 +1639,9 @@ time {
 .image-preview-wrap {
   width: 100%;
   overflow: hidden;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(0, 0, 0, 0.15);
 }
 
 .image-preview {
@@ -1480,28 +1677,40 @@ time {
 
 .favorite-toggle {
   margin-top: 0;
-  border: 1px solid rgba(255, 255, 255, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.3);
+  background: rgba(255, 255, 255, 0.05);
   color: #e2e8f0;
-  padding: 6px 12px;
+  padding: 6px 14px;
   cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.favorite-toggle:hover {
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .favorite-toggle.active {
   background: rgba(251, 191, 36, 0.2);
   border-color: rgba(251, 191, 36, 0.5);
   color: #fde68a;
+  box-shadow: 0 2px 8px rgba(251, 191, 36, 0.2);
 }
 
 .history-delete-btn {
   margin-top: 0;
-  border: 1px solid rgba(244, 114, 182, 0.45);
+  border: 1px solid rgba(244, 114, 182, 0.3);
   border-radius: 999px;
-  background: rgba(190, 24, 93, 0.25);
+  background: rgba(190, 24, 93, 0.15);
   color: #fbcfe8;
-  padding: 6px 12px;
+  padding: 6px 14px;
   cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.history-delete-btn:hover {
+  background: rgba(190, 24, 93, 0.3);
+  transform: scale(1.05);
 }
 
 .empty {
@@ -1605,9 +1814,9 @@ time {
 .ws-address-box,
 .ws-ips {
   margin-top: 6px;
-  padding: 6px 10px;
+  padding: 8px 12px;
   background: rgba(255,255,255,0.05);
-  border-radius: 8px;
+  border-radius: 12px;
   font-size: 12px;
   display: flex;
   align-items: center;

@@ -1,14 +1,19 @@
 <script setup>
-import { ref, watch, nextTick } from 'vue';
+import { ref, watch, nextTick, computed } from 'vue';
 
 const props = defineProps({
   items: { type: Array, required: true },
+  keyword: { type: String, default: "" },
+  totalCount: { type: Number, default: 0 },
   copiedItemId: { type: String, default: "" },
   imagePreviewMap: { type: Object, default: () => ({}) },
   selectedIndex: { type: Number, default: -1 }
 });
 
 const emit = defineEmits(["copy-item", "toggle-favorite", "delete-item", "open-text-preview"]);
+
+const isMac = computed(() => typeof navigator !== 'undefined' && /Mac|iPhone|iPod|iPad/.test(navigator.platform));
+const altKeyName = computed(() => isMac.value ? '⌥ Option' : 'Alt');
 
 const renderLimit = ref(30);
 const itemRefs = ref([]);
@@ -56,15 +61,18 @@ function formatTime(ms) {
 
 <template>
   <section class="history-list" @scroll.passive="onScroll">
-    <article
-      v-for="(item, index) in items.slice(0, renderLimit)"
-      :key="item.id"
-      :ref="el => { if(el) itemRefs[index] = el.$el || el }"
-      :class="['panel', 'history-item', { copied: copiedItemId === item.id, focused: index === props.selectedIndex }]"
-      @click="emit('copy-item', item, $event)"
-    >
-      <div class="hover-copy-hint">点击复制 {{ index < 9 ? `(Alt+${index + 1})` : '' }}</div>
-      <header>
+    <TransitionGroup name="list" tag="div" class="history-list-container">
+      <article
+        v-for="(item, index) in items.slice(0, renderLimit)"
+        :key="item.id"
+        :ref="el => { if(el) itemRefs[index] = el.$el || el }"
+        :class="['panel', 'history-item', { copied: copiedItemId === item.id, focused: index === props.selectedIndex }]"
+        @click="emit('copy-item', item, $event)"
+      >
+        <div class="hover-copy-hint">
+          点击复制 <span v-if="index < 9"><kbd>{{ altKeyName }}</kbd>+<kbd>{{ index + 1 }}</kbd></span>
+        </div>
+        <header>
         <span class="tag" :class="item.type">{{ item.type === "text" ? "文本" : "图片" }}</span>
         <time>{{ formatTime(item.updatedAt) }}</time>
       </header>
@@ -101,16 +109,33 @@ function formatTime(ms) {
         <button class="history-delete-btn" @click.stop="emit('delete-item', item)">删除</button>
       </div>
     </article>
+    </TransitionGroup>
 
     <article v-if="items.length === 0" class="panel empty">
-      <svg class="empty-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
-        <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
-        <path d="M9 14h6"></path>
-        <path d="M9 10h6"></path>
-        <path d="M9 18h4"></path>
-      </svg>
-      <p>暂无历史记录<br/><span style="font-size: 0.85em; opacity: 0.7">复制任意文本或图片后即刻出现</span></p>
+      <template v-if="totalCount === 0">
+        <svg class="empty-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+          <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+          <path d="M9 14h6"></path>
+          <path d="M9 10h6"></path>
+          <path d="M9 18h4"></path>
+        </svg>
+        <p>暂无历史记录<br/><span style="font-size: 0.85em; opacity: 0.7">复制任意文本或图片后即刻出现</span></p>
+      </template>
+      <template v-else>
+        <!-- Search/Filter empty state -->
+        <svg class="empty-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          <line x1="9" y1="9" x2="13" y2="13"></line>
+          <line x1="13" y1="9" x2="9" y2="13"></line>
+        </svg>
+        <p v-if="keyword">
+          未找到包含 "<strong style="color:var(--text-main)">{{ keyword }}</strong>" 的记录<br/>
+          <span style="font-size: 0.85em; opacity: 0.7">请尝试更换搜索词或筛选器</span>
+        </p>
+        <p v-else>当前分类下暂无内容</p>
+      </template>
     </article>
   </section>
 </template>
@@ -120,21 +145,64 @@ function formatTime(ms) {
   position: absolute;
   top: 12px;
   right: 16px;
-  background: rgba(14, 165, 233, 0.9);
-  color: white;
-  padding: 4px 8px;
   font-size: 11px;
-  border-radius: 4px;
+  color: #94a3b8;
   opacity: 0;
-  transform: translateY(-5px);
-  transition: all 0.2s ease;
+  transform: translateY(-4px);
+  transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
   pointer-events: none;
   z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .history-item:hover .hover-copy-hint {
   opacity: 1;
   transform: translateY(0);
+}
+
+kbd {
+  display: inline-block;
+  padding: 1px 4px;
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1;
+  color: #f1f5f9;
+  background-color: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  font-weight: 600;
+  margin: 0 1px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+/* 列表过渡动画 */
+.history-list-container {
+  display: grid;
+  gap: 8px;
+  position: relative;
+}
+
+.list-enter-active,
+.list-leave-active {
+  transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.list-enter-from {
+  opacity: 0;
+  transform: translateY(-20px) scale(0.95);
+}
+
+.list-leave-to {
+  opacity: 0;
+  transform: translateX(30px) scale(0.95);
+}
+
+.list-leave-active {
+  position: absolute;
+  width: 100%;
 }
 
 .focused {

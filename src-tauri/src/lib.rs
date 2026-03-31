@@ -2376,6 +2376,36 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
     }
 }
 
+#[tauri::command]
+fn auto_paste(app: tauri::AppHandle) {
+    // macOS: 彻底隐藏应用以交回焦点给上一个程序
+    #[cfg(target_os = "macos")]
+    let _ = app.hide();
+
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        #[cfg(target_os = "macos")]
+        {
+            let res = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg("tell application \"System Events\" to keystroke \"v\" using command down")
+                .output();
+            if let Ok(out) = res {
+                if !out.status.success() {
+                    eprintln!("AutoPaste AppleScript fail: {:?}", String::from_utf8_lossy(&out.stderr));
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("powershell")
+                .arg("-Command")
+                .arg("$wshell = New-Object -ComObject wscript.shell; $wshell.SendKeys('^v')")
+                .output();
+        }
+    });
+}
+
 
 pub fn run() {
     tauri::Builder::default()
@@ -2477,6 +2507,7 @@ pub fn run() {
             poll_clipboard,
             copy_history_item,
             copy_text,
+            auto_paste,
             toggle_favorite,
             delete_history_item,
             clear_history,
