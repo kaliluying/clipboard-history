@@ -1727,13 +1727,13 @@ fn copy_history_item(id: String, app: AppHandle, state: State<AppState>) -> Resu
         .find(|it| it.id == id)
         .ok_or_else(|| "未找到历史项".to_string())?;
 
-    let mut clipboard = Clipboard::new().map_err(|e| format!("访问系统剪贴板失败: {e}"))?;
-
     if item.item_type == "text" {
         let text = item.text.as_deref().unwrap_or_default().to_string();
-        clipboard
-            .set_text(text)
-            .map_err(|e| format!("写入文本到剪贴板失败: {e}"))?;
+        let _ = app.run_on_main_thread(move || {
+            if let Ok(mut clipboard) = Clipboard::new() {
+                let _ = clipboard.set_text(text);
+            }
+        });
     } else {
         let rel = item
             .image_path
@@ -1741,9 +1741,12 @@ fn copy_history_item(id: String, app: AppHandle, state: State<AppState>) -> Resu
             .ok_or_else(|| "图片路径缺失".to_string())?;
         let path = data_dir(&app)?.join(rel);
         let image = load_image_for_clipboard(&path)?;
-        clipboard
-            .set_image(image)
-            .map_err(|e| format!("写入图片到剪贴板失败: {e}"))?;
+        let image_owned = image.into_owned();
+        let _ = app.run_on_main_thread(move || {
+            if let Ok(mut clipboard) = Clipboard::new() {
+                let _ = clipboard.set_image(image_owned);
+            }
+        });
     }
 
     let mut last = state
@@ -1756,11 +1759,13 @@ fn copy_history_item(id: String, app: AppHandle, state: State<AppState>) -> Resu
 }
 
 #[tauri::command]
-fn copy_text(text: String) -> Result<(), String> {
-    let mut clipboard = Clipboard::new().map_err(|e| format!("访问系统剪贴板失败: {e}"))?;
-    clipboard
-        .set_text(text)
-        .map_err(|e| format!("写入文本到剪贴板失败: {e}"))
+fn copy_text(text: String, app: tauri::AppHandle) -> Result<(), String> {
+    let _ = app.run_on_main_thread(move || {
+        if let Ok(mut clipboard) = Clipboard::new() {
+            let _ = clipboard.set_text(text);
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -2272,10 +2277,13 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
             return;
         };
 
-        // 写入本机剪切板
-        if let Ok(mut cb) = arboard::Clipboard::new() {
-            let _ = cb.set_text(text.to_string());
-        }
+        // 写入本机剪切板 (在主线程执行，防止 macOS 下静默失败)
+        let text_clone = text.to_string();
+        let _ = app.run_on_main_thread(move || {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(text_clone);
+            }
+        });
 
         // 更新指纹，避免 poll_clipboard 重复采集
         let normalized = normalize_text(text);
@@ -2329,14 +2337,16 @@ async fn handle_received_clipboard(app: &AppHandle, json: String) {
 
         match image_item_from_rgba_bytes(app, width, height, rgba_bytes) {
             Ok(item) => {
-                // 写入本机剪切板
+                // 写入本机剪切板 (在主线程执行，防止 macOS 下静默失败)
                 if let Some(rel_path) = &item.image_path {
                     let full_path = data_dir(app).ok().map(|d| d.join(rel_path));
                     if let Some(path) = full_path {
                         if let Ok(img_data) = load_image_for_clipboard(&path) {
-                            if let Ok(mut cb) = arboard::Clipboard::new() {
-                                let _ = cb.set_image(img_data);
-                            }
+                            let _ = app.run_on_main_thread(move || {
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    let _ = cb.set_image(img_data);
+                                }
+                            });
                         }
                     }
                 }
