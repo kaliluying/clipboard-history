@@ -2398,10 +2398,50 @@ fn auto_paste(app: tauri::AppHandle) {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("powershell")
-                .arg("-Command")
-                .arg("$wshell = New-Object -ComObject wscript.shell; $wshell.SendKeys('^v')")
-                .output();
+            // 使用 Win32 SendInput API 直接模拟 Ctrl+V，避免弹出 PowerShell 窗口
+            use std::ffi::c_void;
+
+            const VK_CONTROL: u16 = 0x11;
+            const VK_V: u16 = 0x56;
+            const INPUT_KEYBOARD: u32 = 1;
+            const KEYEVENTF_KEYUP: u32 = 0x0002;
+            const INPUT_SIZE: usize = 40; // sizeof(INPUT) on x64
+
+            extern "system" {
+                fn SendInput(count: u32, inputs: *const c_void, size: i32) -> u32;
+            }
+
+            // 手动构建 4 个 INPUT 结构体（每个 40 字节，x64 布局）
+            // 布局: type(4) + pad(4) + KEYBDINPUT{ wVk(2) + wScan(2) + dwFlags(4) + time(4) + pad(4) + dwExtraInfo(8) } + union_pad(8)
+            let mut buf = [0u8; INPUT_SIZE * 4];
+
+            for (i, (vk, flags)) in [
+                (VK_CONTROL, 0u32),            // Ctrl 按下
+                (VK_V, 0u32),                  // V 按下
+                (VK_V, KEYEVENTF_KEYUP),       // V 释放
+                (VK_CONTROL, KEYEVENTF_KEYUP), // Ctrl 释放
+            ]
+            .iter()
+            .enumerate()
+            {
+                let base = i * INPUT_SIZE;
+                // offset 0: type = INPUT_KEYBOARD
+                buf[base..base + 4].copy_from_slice(&INPUT_KEYBOARD.to_ne_bytes());
+                // offset 4: padding (已为 0)
+                // offset 8: wVk
+                buf[base + 8..base + 10].copy_from_slice(&vk.to_ne_bytes());
+                // offset 10: wScan = 0 (已为 0)
+                // offset 12: dwFlags
+                buf[base + 12..base + 16].copy_from_slice(&flags.to_ne_bytes());
+                // offset 16: time = 0 (已为 0)
+                // offset 20-23: padding (已为 0)
+                // offset 24: dwExtraInfo = 0 (已为 0)
+                // offset 32-39: union padding (已为 0)
+            }
+
+            unsafe {
+                SendInput(4, buf.as_ptr() as *const c_void, INPUT_SIZE as i32);
+            }
         }
     });
 }
