@@ -1741,10 +1741,18 @@ fn copy_history_item(id: String, app: AppHandle, state: State<AppState>) -> Resu
             .ok_or_else(|| "图片路径缺失".to_string())?;
         let path = data_dir(&app)?.join(rel);
         let image = load_image_for_clipboard(&path)?;
-        let image_owned = image.into_owned();
+        // 将 ImageData 转换为可以跨线程传递的数据
+        let width = image.width;
+        let height = image.height;
+        let bytes = image.bytes.into_owned();
         let _ = app.run_on_main_thread(move || {
             if let Ok(mut clipboard) = Clipboard::new() {
-                let _ = clipboard.set_image(image_owned);
+                let img_data = ImageData {
+                    width,
+                    height,
+                    bytes: std::borrow::Cow::Owned(bytes),
+                };
+                let _ = clipboard.set_image(img_data);
             }
         });
     }
